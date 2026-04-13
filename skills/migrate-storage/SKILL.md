@@ -51,25 +51,42 @@ Decision: for each source bucket not in target, plan creation. Public source buc
 
 ## Procedure
 
-### 1. Create target buckets
+### 1. Create target buckets via raw HTTP
 
-**Preferred path: `@insforge/cli`.** Link project first (`npx @insforge/cli link --project-id <id>`), then:
+Stateless, automation-friendly. No CLI login/link required.
 
 ```bash
-# For each source bucket:
-npx @insforge/cli storage create-bucket <bucket-name> --public    # public=true
-npx @insforge/cli storage create-bucket <bucket-name>             # public=false (default)
-npx @insforge/cli storage buckets
+API_URL="$INSFORGE_BASE_URL"
+KEY="$INSFORGE_API_KEY"
+
+create_bucket() {
+  curl -sS -X POST "$API_URL/api/storage/buckets" \
+    -H "Authorization: Bearer $KEY" \
+    -H "Content-Type: application/json" \
+    -d "{\"bucketName\":\"$1\",\"isPublic\":$2}"
+  echo
+}
+
+# For each source bucket from Step 0 probe:
+create_bucket "datarooms"         false
+create_bucket "desktop-releases"  true
+create_bucket "distribution"      false
+
+# Verify:
+curl -sS -H "Authorization: Bearer $KEY" "$API_URL/api/storage/buckets" | jq '.[] | {name, public}'
 ```
 
-**Fallback — direct SQL** (use only when CLI unavailable; DO NOT use `mcp__insforge__create-bucket` unless you've verified the MCP targets this same project):
+Response on success: `{"message":"Bucket created successfully","bucketName":"...","isPublic":...}`.
+Idempotency: POSTing an existing bucket name typically returns an error. Check list first, or catch + ignore "already exists".
+
+**Fallback — direct SQL** (only if HTTP API unavailable; DO NOT use `mcp__insforge__create-bucket` unless its configured project matches your target):
 
 ```bash
-export PGPASSWORD='<insforge-password>'
 psql "$INSFORGE_DB_URL" <<'SQL'
 INSERT INTO storage.buckets (name, public) VALUES
-  ('<bucket1>', true),
-  ('<bucket2>', false)
+  ('datarooms', false),
+  ('desktop-releases', true),
+  ('distribution', false)
 ON CONFLICT (name) DO UPDATE SET public = EXCLUDED.public;
 SELECT name, public FROM storage.buckets ORDER BY name;
 SQL
@@ -125,23 +142,41 @@ Alternative for very large buckets: the reference repo's `npm run export:storage
 
 ### 3. Upload objects to target preserving exact keys
 
-**Verified working flow from trial 2026-04-13** — uploaded 19 objects (99 MB) with exact key preservation:
+**Verified working flow from trial 2026-04-13** — uploaded 19 objects (99 MB) via raw HTTP PUT.
 
 ```bash
-# Ensure CLI is linked to the target project
-npx @insforge/cli link --project-id <project-id>
+API_URL="$INSFORGE_BASE_URL"
+KEY="$INSFORGE_API_KEY"
+
+upload_object() {
+  local local_path="$1" bucket="$2" key="$3"
+  # Key must be segment-encoded: each path segment URL-encoded separately, '/' preserved.
+  local encoded_key
+  encoded_key=$(python3 -c "import sys,urllib.parse as u; print('/'.join(u.quote(s, safe='') for s in sys.argv[1].split('/')))" "$key")
+  curl -sS -X PUT "$API_URL/api/storage/buckets/$bucket/objects/$encoded_key" \
+    -H "Authorization: Bearer $KEY" \
+    -F "file=@$local_path" \
+    -w '%{http_code} '
+  echo "$bucket/$key"
+}
 
 find storage-dl -type f | while read local_path; do
   rel="${local_path#storage-dl/}"               # e.g., desktop-releases/folder/file.exe
   bucket="${rel%%/*}"                           # desktop-releases
   key="${rel#$bucket/}"                         # folder/file.exe
-  npx @insforge/cli storage upload "$local_path" --bucket "$bucket" --key "$key" 2>&1 | tail -1
+  upload_object "$local_path" "$bucket" "$key"
 done | tee upload.log
 ```
 
-Expected output per object: `✓ Uploaded "<key>" to bucket "<bucket>".`
+Expected per object: `{"bucket":"...","key":"...","size":N,"mimeType":"...","uploadedAt":"...","url":"..."} 200 <bucket>/<key>`.
 
-The CLI handles segment encoding, chunked upload, Bearer auth, and retries — preferred over raw curl.
+**Alternative — `@insforge/cli` for interactive human use.** Requires `npx @insforge/cli link --project-id <id>` first (state persists in `.insforge/project.json`):
+
+```bash
+npx @insforge/cli storage upload "$local_path" --bucket "$bucket" --key "$key"
+```
+
+Prefer raw HTTP for automation (no CLI install, no login, no cwd-state).
 
 **Fallback — raw HTTP PUT with key encoding** (use when CLI unavailable):
 
