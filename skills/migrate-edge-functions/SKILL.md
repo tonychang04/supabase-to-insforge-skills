@@ -174,15 +174,36 @@ deploy_fn "sso-callback" "SSO Callback" "SAML/OIDC callback handler"       ".mig
 
 Expected response: `{"success":true,"function":{...},"deployment":{"id":"...","status":"success","url":"..."}}`.
 
-**Update existing function** (same endpoint — returns "function updated" when slug exists):
+**Create vs update semantics (verified 2026-04-13):**
+- `POST /api/functions` returns **409 `ALREADY_EXISTS`** if slug exists — it does NOT upsert.
+- `PUT /api/functions/<slug>` updates an existing function (same body, minus slug).
+- Safe idempotent pattern: POST first; on 409, retry as PUT.
 
 ```bash
-# Some deployments prefer PUT for update; verify with a GET first.
-# POST usually upserts. If you hit a 409, use PUT:
-curl -sS -X PUT "$API_URL/api/functions/<slug>" \
-  -H "Authorization: Bearer $KEY" \
-  -H "Content-Type: application/json" \
-  -d "$payload"
+deploy_or_update() {
+  local slug="$1" file="$2" name="$3" desc="$4"
+  payload=$(python3 -c "
+import json, sys
+print(json.dumps({
+  'slug': sys.argv[1],
+  'name': sys.argv[2],
+  'description': sys.argv[3],
+  'code': open(sys.argv[4]).read()
+}))" "$slug" "$name" "$desc" "$file")
+  # Try create
+  resp=$(curl -sS -X POST "$API_URL/api/functions" \
+    -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+    -d "$payload")
+  if echo "$resp" | grep -q '"ALREADY_EXISTS"'; then
+    # Fall back to update
+    curl -sS -X PUT "$API_URL/api/functions/$slug" \
+      -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+      -d "$payload"
+  else
+    echo "$resp"
+  fi
+  echo
+}
 ```
 
 **Validator error you will hit if your file contains `Deno.serve` anywhere:**
