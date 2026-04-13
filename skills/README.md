@@ -53,7 +53,15 @@ INSFORGE_ANON_KEY="eyJhbGc..."
 | `jq` (optional) | `jq --version` | prettier output |
 | Node.js 20+ (optional) | only if you prefer `@insforge/cli` for interactive use | none mandatory |
 
-**No InsForge CLI login/link is required** — all skills use raw HTTP with the `INSFORGE_API_KEY` for stateless, automation-friendly calls.
+**InsForge CLI login/link is NOT required** for any migration step — all skills use raw HTTP with the `INSFORGE_API_KEY` for stateless, automation-friendly calls.
+
+**But linking is strongly recommended for debugging.** To link:
+
+1. Open the InsForge dashboard for the target project.
+2. Click **Connect** in the top-right → copy the shown login + link command.
+3. Run it in the working directory: creates `.insforge/project.json` with scoped creds.
+
+Once linked, these become available: `npx @insforge/cli db query "<sql>"`, `npx @insforge/cli logs function.logs`, `npx @insforge/cli functions deploy <slug>` (surfaces cold-start errors that raw HTTP swallows — see `migrate-edge-functions/SKILL.md`).
 
 ---
 

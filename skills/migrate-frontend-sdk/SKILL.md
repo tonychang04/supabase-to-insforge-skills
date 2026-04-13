@@ -24,6 +24,17 @@ INSFORGE_BASE_URL                  # public API URL for the target project
 INSFORGE_ANON_KEY                  # anonymous JWT (from Project Settings)
 ```
 
+## Recommended (helpful but not required): link project via CLI for live inspection
+
+While the rewrite itself needs no CLI, linking the target project makes debugging much faster (inspect tables via `npx @insforge/cli db query`, tail backend logs via `npx @insforge/cli logs postgREST.logs`, re-check metadata, etc.).
+
+To link:
+1. Open the InsForge dashboard for the target project.
+2. Click **Connect** in the top-right — it shows a one-time login+link command.
+3. Run it in the repo directory: it creates `.insforge/project.json` with the scoped credentials.
+
+After linking, `npx @insforge/cli current` should print the project name. Add `.insforge/` to `.gitignore`.
+
 ## Diagnostic probe (inventory FIRST, before any edits)
 
 ```bash
