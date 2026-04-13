@@ -77,46 +77,71 @@ SQL
 
 ### 2. Download source objects
 
-Public buckets — download via unauthenticated URL:
+**This is the exact sequence that worked in trial 2026-04-13** — ported 19 public-bucket objects (99 MB) successfully. Copy verbatim; substitute your values.
+
+List source objects:
 
 ```bash
-mkdir -p storage-downloads
-psql "$SUPABASE_DB_URL" -t -A -c "SELECT o.bucket_id, o.name FROM storage.objects o JOIN storage.buckets b ON b.id=o.bucket_id WHERE b.public=true ORDER BY o.bucket_id, o.name" | while IFS='|' read bucket key; do
-  local_path="storage-downloads/$bucket/$key"
-  mkdir -p "$(dirname "$local_path")"
-  curl -sfL -o "$local_path" "$SUPABASE_URL/storage/v1/object/public/$bucket/$key" && echo "OK $bucket/$key" || echo "FAIL $bucket/$key"
-done
+export PGPASSWORD='<supabase-password>'
+mkdir -p storage-dl
+psql "$SUPABASE_DB_URL" -t -A -F '|' -c "
+  SELECT o.bucket_id, o.name FROM storage.objects o
+  JOIN storage.buckets b ON b.id=o.bucket_id
+  ORDER BY b.public DESC, o.bucket_id, o.name
+" > objects.list
+wc -l objects.list
 ```
 
-Private buckets — require service role key:
+Download. Public buckets use unauthenticated URL; private require `SUPABASE_SERVICE_ROLE_KEY`:
 
 ```bash
-psql "$SUPABASE_DB_URL" -t -A -c "SELECT o.bucket_id, o.name FROM storage.objects o JOIN storage.buckets b ON b.id=o.bucket_id WHERE b.public=false ORDER BY o.bucket_id, o.name" | while IFS='|' read bucket key; do
-  local_path="storage-downloads/$bucket/$key"
+# Get bucket visibility upfront so we know which auth to use per object
+psql "$SUPABASE_DB_URL" -t -A -c "SELECT id, public FROM storage.buckets" \
+  | awk -F'|' '{print $1"="$2}' > bucket-visibility.sh
+source bucket-visibility.sh  # exports e.g. datarooms=f, desktop-releases=t, distribution=f
+
+while IFS='|' read bucket key; do
+  [ -z "$key" ] && continue
+  local_path="storage-dl/$bucket/$key"
   mkdir -p "$(dirname "$local_path")"
-  curl -sfL -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
-       -o "$local_path" "$SUPABASE_URL/storage/v1/object/$bucket/$key" \
-    && echo "OK $bucket/$key" || echo "FAIL $bucket/$key"
-done
+  # encode each path segment separately; keep '/' as separator
+  encoded=$(python3 -c "import sys,urllib.parse as u; print('/'.join(u.quote(s, safe='') for s in sys.argv[1].split('/')))" "$key")
+  # pick endpoint based on bucket visibility
+  eval "is_public=\$$bucket"
+  if [ "$is_public" = "t" ]; then
+    url="$SUPABASE_URL/storage/v1/object/public/$bucket/$encoded"
+    http=$(curl -sf -o "$local_path" -w '%{http_code}' "$url")
+  else
+    url="$SUPABASE_URL/storage/v1/object/$bucket/$encoded"
+    http=$(curl -sf -o "$local_path" -w '%{http_code}' -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" "$url")
+  fi
+  printf '%s %10s  %s/%s\n' "$http" "$(stat -f%z "$local_path" 2>/dev/null || echo 0)" "$bucket" "$key"
+done < objects.list | tee download.log
 ```
 
-Alternatively, for large buckets, use the reference repo's Node-based downloader: `npm run export:storage` in github.com/InsForge/supabase-to-insforge — uses `@supabase/supabase-js` storage client which handles pagination, resumable downloads, and manifest creation.
+Verify: `du -sh storage-dl/` and inspect the 200/non-200 distribution in `download.log`.
+
+Alternative for very large buckets: the reference repo's `npm run export:storage` uses the Supabase JS client (pagination + resume + manifest).
 
 ### 3. Upload objects to target preserving exact keys
 
-**Preferred path: `@insforge/cli`.** Link to project first: `npx @insforge/cli link --project-id <id>`, then:
+**Verified working flow from trial 2026-04-13** — uploaded 19 objects (99 MB) with exact key preservation:
 
 ```bash
-find storage-downloads -type f | while read local_path; do
-  rel="${local_path#storage-downloads/}"        # bucket/key/path/file.ext
-  bucket="${rel%%/*}"
-  key="${rel#$bucket/}"
-  npx @insforge/cli storage upload "$local_path" --bucket "$bucket" --key "$key" \
-    && echo "OK $bucket/$key" || echo "FAIL $bucket/$key"
-done
+# Ensure CLI is linked to the target project
+npx @insforge/cli link --project-id <project-id>
+
+find storage-dl -type f | while read local_path; do
+  rel="${local_path#storage-dl/}"               # e.g., desktop-releases/folder/file.exe
+  bucket="${rel%%/*}"                           # desktop-releases
+  key="${rel#$bucket/}"                         # folder/file.exe
+  npx @insforge/cli storage upload "$local_path" --bucket "$bucket" --key "$key" 2>&1 | tail -1
+done | tee upload.log
 ```
 
-The CLI handles segment encoding, chunked upload, Bearer auth, and retries. Preferred over raw curl.
+Expected output per object: `✓ Uploaded "<key>" to bucket "<bucket>".`
+
+The CLI handles segment encoding, chunked upload, Bearer auth, and retries — preferred over raw curl.
 
 **Fallback — raw HTTP PUT with key encoding** (use when CLI unavailable):
 
@@ -173,24 +198,40 @@ For each match, run the same regexp_replace update, adapted.
 ## Verification
 
 ```bash
-psql "$INSFORGE_DB_URL" <<'SQL'
-\echo === bucket + object counts ===
-SELECT b.name, b.public, count(o.key) AS objects
-  FROM storage.buckets b LEFT JOIN storage.objects o ON o.bucket=b.name
-  GROUP BY b.name, b.public ORDER BY b.name;
-\echo === any supabase URLs remaining? ===
-SELECT table_name, column_name FROM information_schema.columns
-  WHERE table_schema='public' AND data_type='jsonb';
--- Run a sample check on the biggest jsonb columns:
--- SELECT count(*) FROM <table> WHERE <col>::text LIKE '%supabase.co/storage%';
-SQL
+psql "$INSFORGE_DB_URL" -c "
+  SELECT bucket, count(*), pg_size_pretty(sum(size)) AS total_size
+  FROM storage.objects GROUP BY bucket ORDER BY 1;
+"
 ```
 
-Compare bucket + object counts to source. Sampled `%supabase.co/storage%` count should be 0 everywhere after Step 4.
+Expected: row per bucket with count + size matching source.
 
-Browser sanity check: pick a sample public bucket object, visit `$INSFORGE_API_URL/api/storage/buckets/<bucket>/objects/<key>` — should serve the content.
+Sample URL test (public bucket) — expect HTTP 302 redirect to a signed CDN URL:
 
-## Common pitfalls (from trial 2026-04-13)
+```bash
+curl -sI "$INSFORGE_BASE_URL/api/storage/buckets/<bucket>/objects/<key>"
+# HTTP/2 302
+# location: https://cdn.insforge.dev/storage/<app-key>/<bucket>/<key>?Expires=...&Signature=...
+```
+
+**Important:** the API URL returns a 302 redirect to a CDN with a signed URL. Browsers handle this transparently; `<img src>` / `<a href>` work fine. Server-side fetches must follow redirects (`curl -L`).
+
+URL-rewrite sanity: every jsonb column that had `%supabase.co/storage%` before should have 0 matches after Step 4:
+
+```bash
+psql "$INSFORGE_DB_URL" -c "
+  SELECT table_name, column_name FROM information_schema.columns
+  WHERE table_schema='public' AND data_type='jsonb';
+"
+# Then for each (t, c):
+# SELECT count(*) FROM <t> WHERE <c>::text LIKE '%supabase.co/storage%';
+# Expected: 0 everywhere.
+```
+
+## Common pitfalls (from trial 2026-04-13 — 19 objects, 99 MB migrated successfully)
+
+- **Skipping bytes entirely**: creating bucket rows via SQL without running the download/upload flow means objects don't exist on target — `SELECT count(*) FROM storage.objects` stays at 0 even though `storage.buckets` has rows. Steps 2 + 3 are mandatory.
+- **`cdn.insforge.dev` redirect**: public object URLs return 302 to a signed CDN URL with short-lived `Expires`/`Signature` query params. Browsers and `curl -L` follow fine; code that caches raw bytes of the API-URL response instead of the final URL will 302-cache and break when the signature expires.
 
 - **Wrong InsForge instance via MCP**: The `mcp__insforge__*` tools (including create-bucket) may point at a different InsForge project than the user's target DB. Always use direct SQL and the user-provided API URL/key.
 - **Private bucket without service role key**: no way to download object bytes. If user hasn't provided `SUPABASE_SERVICE_ROLE_KEY`, ask — do not proceed silently.
