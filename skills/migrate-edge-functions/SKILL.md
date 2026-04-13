@@ -27,6 +27,14 @@ INSFORGE_API_KEY                # ik_... project_admin key
 
 All deploy ops are stateless HTTP against `INSFORGE_BASE_URL` with the Bearer token — no CLI install or login required.
 
+**If you need the CLI (e.g., for debugging cold-start errors — see below), the authentication flow has a non-obvious first step:**
+
+1. Open the InsForge dashboard for the target project in a browser.
+2. Click the **"Connect"** button in the top-right of the dashboard header — this opens a modal with a one-time connect command that authenticates the CLI to this specific project.
+3. Copy that command (typically `npx @insforge/cli login` followed by `npx @insforge/cli link --project-id <id>`) and run it in your terminal.
+
+Without this connect step, `npx @insforge/cli functions deploy ...` fails with "No project linked" or 401. Once connected, the `.insforge/project.json` is populated in the current directory and all CLI ops work.
+
 **Exception — keep `@insforge/cli` around for debugging cold-start crashes.** The raw-HTTP deploy response reports `deployment.status: success` as soon as the DB row is written, but *does not wait for the runtime to successfully load the module*. If module-level code throws (see "Common pitfalls"), the DB shows `status: active` and `deployedAt: <now>`, but the function runtime returns 404 at invoke time. The CLI's `functions deploy` command surfaces the actual runtime exception (with file:line from the Deno loader):
 
 ```
