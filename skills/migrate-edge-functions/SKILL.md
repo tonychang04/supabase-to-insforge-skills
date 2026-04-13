@@ -25,7 +25,17 @@ INSFORGE_BASE_URL               # e.g., https://<app-key>.<region>.insforge.app
 INSFORGE_API_KEY                # ik_... project_admin key
 ```
 
-No CLI install required. No login. No `link`. All ops are stateless HTTP against `INSFORGE_BASE_URL` with Bearer token.
+All deploy ops are stateless HTTP against `INSFORGE_BASE_URL` with the Bearer token — no CLI install or login required.
+
+**Exception — keep `@insforge/cli` around for debugging cold-start crashes.** The raw-HTTP deploy response reports `deployment.status: success` as soon as the DB row is written, but *does not wait for the runtime to successfully load the module*. If module-level code throws (see "Common pitfalls"), the DB shows `status: active` and `deployedAt: <now>`, but the function runtime returns 404 at invoke time. The CLI's `functions deploy` command surfaces the actual runtime exception (with file:line from the Deno loader):
+
+```
+Error: Missing API key. Pass it to the constructor `new Resend("re_123")`
+    at file:///src/functions/send-org-invite.ts:18:16
+Error: Function deployment failed
+```
+
+So: use raw HTTP for the migration script itself, but if any function returns 404 at invoke-time despite `status: active`, redeploy the same file via `npx @insforge/cli functions deploy <slug> --file <path>` to see the real error. (Interactive `supabase login`-style flow is not required for InsForge CLI deploy once the project is linked; you can also re-read logs via `/api/logs/function-deploy.logs` if exposed.)
 
 ## Canonical function format (verified against live runtime 2026-04-13)
 
@@ -39,7 +49,47 @@ No CLI install required. No login. No `link`. All ops are stateless HTTP against
   - `API_KEY` — project_admin
   - `ANON_KEY` — anonymous JWT
 
-## Diagnostic probe (raw HTTP, no CLI)
+## Diagnostic probe
+
+### Step 0 — CRITICAL: discover ALL deployed source functions
+
+**Supabase Edge Functions source code is NOT stored in the Postgres database** (verified against a live Supabase Cloud instance 2026-04-13 — no `functions` schema, no functions bucket in `storage.buckets`, no `code`/`source` columns anywhere). It lives on Supabase's separate Deno runtime.
+
+**The local repo is NOT authoritative.** Functions can be deployed directly via `supabase functions deploy` without committing source. You MUST compare the deployed list to the repo.
+
+Get the deployed list (three ways, in order of preference):
+
+```bash
+# Option A: Supabase CLI (requires login + project ref)
+supabase login                                          # opens browser for access token
+supabase link --project-ref <supabase-project-ref>      # e.g., jnaynuqhbfchrblquaoc
+supabase functions list                                 # print table of deployed functions
+supabase functions download <slug>                      # pulls source to supabase/functions/<slug>/
+
+# Option B: Supabase dashboard
+#   Project → Edge Functions → click each → "Download"
+
+# Option C: rewrite from scratch
+#   If you can't retrieve source, infer the contract from frontend call sites and DB triggers.
+#   Grep the frontend:   grep -rnE "functions\.invoke\(['\"][^'\"]+"
+#   Grep Supabase auth config in dashboard for email/invite hooks that point at a function.
+```
+
+Then scan the source:
+
+```bash
+ls <repo>/supabase/functions/
+# Local list MUST match the deployed list. Any function deployed but missing from repo
+# = must be downloaded or rewritten before this skill can port it.
+for fn in <repo>/supabase/functions/*/; do
+  echo "=== $fn ==="
+  grep -rE "from ['\"].*@supabase/supabase-js|Deno\.env\.get|serve\(|supabase\.auth\.admin|supabase\.channel\(|supabase\.rpc" "$fn"
+done
+```
+
+For each function: capture env vars used, SDK methods called, flag `auth.admin.*` / `channel()` for manual.
+
+### Step 0a — Probe target
 
 ```bash
 API_URL="$INSFORGE_BASE_URL"
@@ -50,13 +100,7 @@ curl -sS -H "Authorization: Bearer $KEY" "$API_URL/api/functions"
 
 # List existing secrets on target (reserved + user-added)
 curl -sS -H "Authorization: Bearer $KEY" "$API_URL/api/secrets"
-
-# Scan source
-ls <repo>/supabase/functions/
-grep -rE "from ['\"].*@supabase/supabase-js|Deno\.env\.get|serve\(|supabase\.auth\.admin|supabase\.channel\(|supabase\.rpc" <repo>/supabase/functions/<fn>/
 ```
-
-For each function: capture env vars used, SDK methods called, flag `auth.admin.*` / `channel()` for manual.
 
 ## Rewrite rules (apply mechanically per function)
 
