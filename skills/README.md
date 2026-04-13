@@ -55,13 +55,19 @@ INSFORGE_ANON_KEY="eyJhbGc..."
 
 **InsForge CLI login/link is NOT required** for any migration step — all skills use raw HTTP with the `INSFORGE_API_KEY` for stateless, automation-friendly calls.
 
-**But linking is strongly recommended for debugging.** To link:
+**But linking is strongly recommended for debugging.** Once you know the target project ID (UUID from the InsForge dashboard — e.g., `d84cbc8f-28d4-45f6-9ded-5e168d21975e`), link with a single command:
 
-1. Open the InsForge dashboard for the target project.
-2. Click **Connect** in the top-right → copy the shown login + link command.
-3. Run it in the working directory: creates `.insforge/project.json` with scoped creds.
+```bash
+cd <frontend-repo-or-working-dir>
+npx @insforge/cli link --project-id <project-id-uuid>
+npx @insforge/cli current       # verify: should print your project name, app-key, OSS host
+```
 
-Once linked, these become available: `npx @insforge/cli db query "<sql>"`, `npx @insforge/cli logs function.logs`, `npx @insforge/cli functions deploy <slug>` (surfaces cold-start errors that raw HTTP swallows — see `migrate-edge-functions/SKILL.md`).
+The command reads credentials from the dashboard (you need to have run **Connect** in the dashboard top-right at least once to establish the CLI session), creates `.insforge/project.json` in the current directory with scoped credentials, and from then on all CLI commands operate against the linked project.
+
+Add `.insforge/` to `.gitignore`.
+
+Once linked, these become available: `npx @insforge/cli db query "<sql>"`, `npx @insforge/cli logs function.logs --tail`, `npx @insforge/cli functions deploy <slug>` (surfaces cold-start errors that raw HTTP swallows — see `migrate-edge-functions/SKILL.md`), `npx @insforge/cli storage buckets`, `npx @insforge/cli secrets list`.
 
 ---
 
