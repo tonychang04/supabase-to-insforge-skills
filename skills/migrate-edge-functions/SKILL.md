@@ -192,6 +192,7 @@ Prefer rewriting frontend calls to `client.functions.invoke('<slug>')` — SDK c
 ## Common pitfalls (from trial 2026-04-13)
 
 - **`Deno.serve()` wrapper rejected**: CLI deploy errors with `Functions should use "export default async function(req: Request)" instead of "Deno.serve()"`. Default export is mandatory.
+- **Validator matches `Deno.serve` in COMMENTS too**: the deploy-time regex scanner does NOT parse TypeScript — any literal occurrence of `Deno.serve` in a comment or string anywhere in the file triggers rejection. Strip all mentions from code comments, docstrings, and template strings before deploying. Observed 2026-04-13: a block comment explaining "CLI rejects `Deno.serve(...)`" caused deploy failure even though no actual `Deno.serve(` call existed.
 - **Wrong SDK source**: `jsr:@insforge/sdk` does NOT exist (as of verification). Use `npm:@insforge/sdk@latest`.
 - **Wrong baseUrl pattern**: older examples show `http://insforge:7130` — this DNS name does not resolve on current cloud runtime. Use `Deno.env.get('INSFORGE_INTERNAL_URL')` with a fallback to `INSFORGE_BASE_URL`.
 - **Wrong env var name**: older examples show `ACCESS_API_KEY` — the current reserved name is `API_KEY`. Verified via `secrets list` showing `API_KEY, ANON_KEY, INSFORGE_BASE_URL, INSFORGE_INTERNAL_URL` all auto-provided.
