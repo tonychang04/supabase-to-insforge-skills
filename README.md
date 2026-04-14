@@ -151,6 +151,7 @@ These skills are built for modern targets and the orchestrator's probe tells you
 - Trial target InsForge project: `kx9jfb7d.us-east.insforge.app` (STET AI)
 - Live PR on stet: https://github.com/SritejBommaraju/stet/pull/9
 - Reference migration toolkit: https://github.com/InsForge/supabase-to-insforge
+- This repo: https://github.com/tonychang04/supabase-to-insforge-skills
 
 ---
 
