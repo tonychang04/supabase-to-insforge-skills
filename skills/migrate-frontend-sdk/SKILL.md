@@ -409,7 +409,34 @@ console.log(`Rewrote ${fromRewrites} .from() + ${insertRewrites} .insert() calls
 
 Run: `npm i -D ts-morph && npx tsx scripts/migrate-ast.ts`.
 
-### 8. Env var names — beyond the provider wrapper
+### 8a. Rename local variable `supabase` → `insforge` for readability
+
+After the SDK swap, local variables still named `supabase` become misleading:
+
+```typescript
+// Confusing — is this Supabase or InsForge now?
+const supabase = createClient();
+const { data } = await supabase.database.from("t").select("*");
+```
+
+Use word-boundary regex to rename the identifier. **Important:** macOS BSD `sed` does NOT support `\b` — use Perl:
+
+```bash
+grep -rlE "const +supabase +=" --include='*.ts' --include='*.tsx' . \
+  | grep -v node_modules | grep -v lib/insforge | grep -v __tests__ \
+  | grep -v "supabase/functions" \
+  | while IFS= read -r f; do
+      perl -i -pe 's/\bsupabase\b/insforge/g' "$f"
+    done
+```
+
+This keeps intentional `supabase` mentions in:
+- `lib/security/redaction.ts` patterns that still redact legacy tokens
+- Comments referencing the migration origin
+
+Verify with a grep that excludes those categories and confirm build still passes before committing.
+
+### 8b. Env var names — beyond the provider wrapper
 
 `process.env.NEXT_PUBLIC_SUPABASE_*` references are often **outside** the `lib/supabase/client.ts` file that you rewrote. Grep broadly before declaring the migration done:
 
