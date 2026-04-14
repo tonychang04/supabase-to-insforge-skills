@@ -288,6 +288,127 @@ grep -rnE "from '@insforge/sdk'" --include='*.ts' --include='*.tsx' --include='*
 grep -rnE "client\.(auth|database|storage|functions)" --include='*.ts' --include='*.tsx' --include='*.js' --include='*.jsx' . | wc -l  # non-zero
 ```
 
+## Full SDK API gap table — what needs manual rewrite (verified 2026-04-13)
+
+Every item in this table was hit during a real green-build migration of stet (30 files, 51 call sites). These are NOT candidates for sed — each needs either manual replacement or a decision.
+
+### Auth surface
+
+| Supabase pattern | Count hit in stet | InsForge replacement | Effort |
+|---|---|---|---|
+| `auth.getSession()` → `data.session.access_token` | 4 | `getCurrentUser()` returns `{user}`, no session object. For raw token access, read `localStorage.getItem('insforge-auth-token')` and parse `.accessToken` | per-site judgment |
+| `auth.getUser()` | 15+ | `auth.getCurrentUser()` | sed OK |
+| `auth.onAuthStateChange(cb)` | 1 | No event subscription API. Pattern used: `visibilitychange` listener → `getCurrentUser()` + explicit refresh in sign-in/out handlers | manual |
+| `auth.updateUser({ password })` | 1 | `sendResetPasswordEmail({email})` → email → `exchangeResetPasswordToken({otp, newPassword})`. Two-step UX now, unavoidable | manual + UX change |
+| `auth.resetPasswordForEmail(email, {redirectTo})` | 2 | `sendResetPasswordEmail({email, redirectTo})` | manual (method rename + arg shape) |
+| `auth.signUp({options: {data}})` | 1 | `signUp({name})` + separate `setProfile(extras)` call after | manual |
+| `auth.admin.*` | (varies) | No `admin` namespace. Admin client + direct `.database.from('auth.users')` | per-method manual |
+
+### Type name differences
+
+| Supabase type | InsForge type | Where it appears |
+|---|---|---|
+| `import type { User } from '@supabase/supabase-js'` | `import type { UserSchema } from '@insforge/sdk'` | auth providers, navbars, anywhere typed as User |
+| `import type { Session } from '@supabase/supabase-js'` | `import type { AuthSession } from '@insforge/sdk'` | auth providers |
+| `user.email_confirmed_at` / `user.confirmed_at` | `user.emailVerified` (boolean) | verification gates |
+| `user.created_at`, `user.updated_at` | `user.createdAt`, `user.updatedAt` (camelCase) | plan hooks, audit logs |
+| `user.user_metadata` | `user.metadata` | profile reads, cast may be needed |
+| `user.app_metadata` | `user.profile` or `user.metadata` (nesting differs) | role checks |
+| `session.access_token`, `refresh_token`, `expires_at`, `expires_in`, `token_type` | `.accessToken`, `.refreshToken`, `.expiresAt`, `.expiresIn`, `.tokenType` (camelCase) | custom bearer-header builders |
+
+Recommended one-shot sed pass for camelCase (run AFTER import swaps):
+
+```bash
+grep -rlE "\.(access_token|refresh_token|expires_at|expires_in|token_type|user_metadata|app_metadata)\b" --include='*.ts' --include='*.tsx' . \
+  | grep -v node_modules | grep -v 'lib/supabase/' | while IFS= read -r f; do
+    sed -i.bak -E '
+      s/\.access_token\b/.accessToken/g
+      s/\.refresh_token\b/.refreshToken/g
+      s/\.expires_at\b/.expiresAt/g
+      s/\.expires_in\b/.expiresIn/g
+      s/\.token_type\b/.tokenType/g
+      s/\.user_metadata\b/.metadata/g
+      s/\.app_metadata\b/.profile/g
+    ' "$f"
+  done
+find . -name '*.bak' -not -path './node_modules/*' -delete
+```
+
+**Warning:** the above blindly renames `.expires_at` on domain objects too (e.g., `invite.expires_at`, `policy.expires_at`). Review the diff — domain fields should keep snake_case. A safer version scopes to known session/user receivers (use ts-morph instead).
+
+## AST rewrite script (copy-paste)
+
+The `.from()` and `.insert()` rewrites cannot be done with sed alone. Use this ts-morph script (verified — 92 `.from()` + 19 `.insert()` rewrites on stet):
+
+```typescript
+// scripts/migrate-ast.ts
+import { Project, SyntaxKind, Node } from "ts-morph";
+const CLIENT_NAMES = new Set(["supabase", "client", "insforge", "adminClient"]);
+const p = new Project({ tsConfigFilePath: "tsconfig.json" });
+let fromRewrites = 0, insertRewrites = 0;
+
+function rootIdentifier(n: Node): string | null {
+  let cur: Node | undefined = n;
+  while (cur) {
+    if (cur.getKind() === SyntaxKind.Identifier) return cur.getText();
+    if (cur.getKind() === SyntaxKind.PropertyAccessExpression) {
+      cur = cur.asKindOrThrow(SyntaxKind.PropertyAccessExpression).getExpression();
+    } else if (cur.getKind() === SyntaxKind.CallExpression) {
+      cur = cur.asKindOrThrow(SyntaxKind.CallExpression).getExpression();
+    } else if (cur.getKind() === SyntaxKind.AwaitExpression) {
+      cur = cur.asKindOrThrow(SyntaxKind.AwaitExpression).getExpression();
+    } else return null;
+  }
+  return null;
+}
+
+for (const sf of p.getSourceFiles()) {
+  const path = sf.getFilePath();
+  if (path.includes("/node_modules/") || path.includes("/lib/supabase/")
+      || path.includes("/lib/insforge/") || path.includes("/supabase/functions/")
+      || path.match(/\.test\.(ts|tsx)$/) || path.includes("/__tests__/")) continue;
+  let changed = false;
+
+  // Rewrite .from → .database.from on known client chains
+  sf.forEachDescendant((node) => {
+    if (node.getKind() !== SyntaxKind.PropertyAccessExpression) return;
+    const pa = node.asKindOrThrow(SyntaxKind.PropertyAccessExpression);
+    if (pa.getName() !== "from") return;
+    const receiver = pa.getExpression();
+    if (/^[A-Z]/.test(receiver.getText())) return;  // skip Array.from etc
+    const root = rootIdentifier(receiver);
+    if (!root || !CLIENT_NAMES.has(root)) return;
+    if (receiver.getText().includes(".database")) return;
+    pa.replaceWithText(`${receiver.getText()}.database.from`);
+    fromRewrites++; changed = true;
+  });
+
+  // Wrap .insert(obj) → .insert([obj]) if arg is not already an array/spread
+  sf.forEachDescendant((node) => {
+    if (node.getKind() !== SyntaxKind.CallExpression) return;
+    const ce = node.asKindOrThrow(SyntaxKind.CallExpression);
+    const expr = ce.getExpression();
+    if (expr.getKind() !== SyntaxKind.PropertyAccessExpression) return;
+    const pa = expr.asKindOrThrow(SyntaxKind.PropertyAccessExpression);
+    if (pa.getName() !== "insert") return;
+    const root = rootIdentifier(pa.getExpression());
+    if (!root || !CLIENT_NAMES.has(root)) return;
+    const args = ce.getArguments();
+    if (args.length === 0) return;
+    const first = args[0];
+    if (first.getKind() === SyntaxKind.ArrayLiteralExpression) return;
+    if (first.getText().trim().startsWith("...")) return;
+    first.replaceWithText(`[${first.getText()}]`);
+    insertRewrites++; changed = true;
+  });
+
+  if (changed) sf.saveSync();
+}
+console.log(`Rewrote ${fromRewrites} .from() + ${insertRewrites} .insert() calls`);
+```
+
+Run: `npm i -D ts-morph && npx tsx scripts/migrate-ast.ts`.
+
 ## Hard lessons from a real trial (stet repo, 2026-04-13)
 
 These are **failures** encountered when attempting a mechanical sed-based migration. Encode them as non-negotiable rules.
