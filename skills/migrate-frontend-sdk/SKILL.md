@@ -334,7 +334,31 @@ Regex can't reliably decide whether an `.insert(` argument is already an array, 
 
 Do NOT claim the migration is done until `npm run build` exits 0. Intermediate states ("imports swapped, call sites rewritten, compile fails") are migration-in-progress, not migration-done. The skill's verification step `npx tsc --noEmit && npm run build` must succeed; all other signals are secondary.
 
-### 4. Inspect the actual SDK types before rewriting
+### 4a. Actual InsForge SDK surface — verified 2026-04-13
+
+Read from `node_modules/@insforge/sdk/dist/index.d.ts`. Methods that exist on `client.auth`:
+
+```
+signUp, signInWithPassword, signOut, signInWithOAuth, exchangeOAuthCode,
+signInWithIdToken, refreshSession, getCurrentUser, getProfile, setProfile,
+resendVerificationEmail, verifyEmail, exchangeResetPasswordToken, resetPassword
+```
+
+Patterns that exist in Supabase but NOT in InsForge (require call-site rebuild, not replacement):
+
+| Supabase | InsForge status | Workaround |
+|---|---|---|
+| `auth.onAuthStateChange(cb)` | **absent** | poll `getCurrentUser()` on mount + focus, or subscribe to your own store after explicit sign-in/out |
+| `auth.admin.createUser(...)` | **no `admin` namespace** | admin client with `API_KEY`, direct DB INSERT into `auth.users` via `.database.from('auth.users').insert([{...}])` |
+| `auth.admin.getUserByEmail(...)` | **no `admin` namespace** | admin client, `.database.from('auth.users').select().eq('email', x).maybeSingle()` |
+| `auth.admin.deleteUser(x)` | **no `admin` namespace** | admin client, `.database.from('auth.users').delete().eq('id', x)` |
+| `auth.admin.createSession(...)` | **no equivalent** | not portable in one call; SSO flow needs rebuild |
+| `auth.updateUser({ password: ... })` | **absent** | `resetPassword()` + user clicks link + `exchangeResetPasswordToken()` |
+| `auth.getSession()` | **absent** | use `getCurrentUser()` — returns `{ user: ... }` wrapper |
+
+**Critical:** do NOT sed-replace `onAuthStateChange` with `onSessionChange` — `onSessionChange` does not exist either. The replacement compiles but fails at runtime with "property does not exist".
+
+### 4b. Inspect the actual SDK types before rewriting
 
 Published docs, CLI `docs` command, and community examples can lag the installed SDK version. Before bulk rewrites:
 
