@@ -17,24 +17,65 @@ description: Use when a user wants to migrate an application from Supabase to In
 - User only wants to port RLS policies between two Postgres databases without moving platforms → this skill is overkill
 - User is doing the reverse direction (InsForge → Supabase) → not supported
 
-## Inputs required
+## Step 0 — Ask the user for these inputs BEFORE doing anything
 
-From the user, gather BEFORE starting:
+**STOP**. Do not probe, dump, or write any files until you have all the required values. Ask the user for everything in one block; re-ask for anything they omit.
 
-```
-Source (Supabase):
-  SUPABASE_DB_URL                 # postgresql://postgres.<ref>:<pw>@<pooler>:6543/postgres  (read access minimum)
-  SUPABASE_URL                    # https://<ref>.supabase.co                                (for storage public URLs)
-  SUPABASE_SERVICE_ROLE_KEY       # required ONLY for private-bucket object download
+### Required (blocking)
 
-Target (InsForge):
-  INSFORGE_DB_URL                 # postgresql://postgres:<pw>@<host>:5432/insforge?sslmode=require  (write access)
-  INSFORGE_API_URL                # e.g., https://<host>.insforge.app  (for storage object uploads)
-  INSFORGE_API_KEY                # project_admin API key              (for storage HTTP PUTs)
+| Ask for | Where user gets it | What it unlocks | Example |
+|---|---|---|---|
+| `SUPABASE_DB_URL` | Supabase → Project Settings → Database → Connection string → **Transaction pooler** | everything on source side | `postgresql://postgres.<ref>:<pw>@<region>.pooler.supabase.com:6543/postgres` |
+| `INSFORGE_DB_URL` | InsForge → Settings → Database → Connection string (direct) | writing target schema + data | `postgresql://postgres:<pw>@<host>:5432/insforge?sslmode=require` |
+| `INSFORGE_BASE_URL` | InsForge → Project → Overview → Project URL | storage uploads, function deploys, frontend SDK | `https://<app-key>.<region>.insforge.app` |
+| `INSFORGE_API_KEY` | InsForge → Settings → API → **API Key** (starts with `ik_`) | admin HTTP operations | `ik_...` |
+| `INSFORGE_ANON_KEY` | InsForge → Settings → API → **Anon Key** (JWT) | public frontend client | `eyJhbGc...` |
 
-Frontend (optional, only if doing SDK rewrite):
-  Path to the frontend repo that uses @supabase/supabase-js
-```
+### Conditional (ask only if relevant to user's scope)
+
+| Ask for | Needed when | Without it, what's blocked |
+|---|---|---|
+| `SUPABASE_URL` (https://\<ref\>.supabase.co) | migrating storage | public-bucket object downloads |
+| `SUPABASE_SERVICE_ROLE_KEY` | migrating storage AND any bucket is private | private-bucket object downloads (auth required) |
+| Frontend repo path | rewriting `@supabase/supabase-js` call sites | `migrate-frontend-sdk` skill |
+| Edge-functions directory path (typically `<repo>/supabase/functions/`) | migrating edge functions | `migrate-edge-functions` skill |
+
+### Ask proactively — user may not realize these matter
+
+- "What layers are in scope — database / auth / storage / edge functions / frontend SDK / all?" (scopes the work)
+- "Does your Supabase project have edge functions? Source can live on Supabase's runtime and NOT in the repo. Run `supabase functions list --project-ref <ref>` to confirm." (hidden functions get missed otherwise)
+- "Do you use `supabase.channel()` / presence / broadcast realtime?" (does NOT auto-port)
+- "Do you use `supabase.auth.admin.createSession` or similar admin-scope auth APIs (e.g., SSO callbacks)?" (no direct InsForge equivalent)
+- "Do you use Supabase Vault (`vault.secrets`)?" (manual re-entry only)
+- "Any MFA / SAML / SSO configured?" (re-configure manually on InsForge)
+
+### Do NOT ask — already discoverable
+
+- Table list, row counts, enum list, bucket names — the Step 1 probe surfaces these
+- RLS policy bodies — `pg_dump` captures them verbatim
+- User passwords (other than for manual login testing) — bcrypt hashes migrate byte-for-byte
+- Supabase JWT secret — InsForge re-signs; old secret is useless
+
+### Exact prompt to paraphrase to the user
+
+> Before I start, I need a few things from your InsForge and Supabase dashboards — paste them all in one message:
+>
+> **From Supabase:**
+> 1. Database connection string (Project Settings → Database → **Transaction pooler**)
+> 2. Project URL (`https://<ref>.supabase.co`)
+> 3. Service role key — **only if you have private storage buckets**
+>
+> **From InsForge:**
+> 4. Database connection string (Settings → Database)
+> 5. Project URL (`https://<app-key>.<region>.insforge.app`)
+> 6. API key (starts with `ik_`)
+> 7. Anon key (JWT — only if I'll be rewriting a frontend repo)
+>
+> **And tell me:**
+> - What you want migrated (database / auth / storage / edge functions / frontend SDK / all)
+> - Whether your app uses `supabase.channel()` realtime, `supabase.auth.admin.*` admin APIs, or Supabase Vault — these don't auto-port.
+
+Wait for the full response. If a conditional item is missing, ask whether that layer is in scope before proceeding.
 
 ## Step 1 — Diagnostic probe
 
