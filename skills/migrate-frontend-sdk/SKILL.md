@@ -492,7 +492,69 @@ grep -rE "^export.*createClient|^declare.*createClient" node_modules/@insforge/s
 
 Especially check: exact `createClient` return type, namespacing (`.database.from` vs `.from`), method renames (`getUser` vs `getCurrentUser`), array-wrap requirements on `insert`.
 
-### 5. SSR cookie names are not documented; inspect runtime
+### 5. SSR cookie name — verified 2026-04-13
+
+Actual observed cookie after live signup + email_verified=true flag + login:
+
+```
+Set-Cookie: insforge_refresh_token=<JWT>;
+  Max-Age=604800;
+  Path=/api/auth;
+  Expires=<7 days>;
+  HttpOnly; Secure; SameSite=None
+```
+
+Use **exact-match** on cookie name — do NOT prefix-match. Prefixes like `insforge-` (with dash) or `insforge_` (with underscore) can accidentally catch unrelated cookies if InsForge adds new ones.
+
+```typescript
+// lib/insforge/server.ts
+const refreshCookie = cookieStore
+    .getAll()
+    .find((c) => c.name === "insforge_refresh_token");
+```
+
+**Reproducing the probe** (any future InsForge version might change this — re-verify on upgrade):
+
+```bash
+API_URL="https://<app-key>.<region>.insforge.app"
+ANON="<anon-JWT>"
+ADMIN_KEY="ik_..."
+
+TEST="probe-$(date +%s)@test.local"
+# 1. signup
+curl -sS -X POST "$API_URL/api/auth/users" \
+  -H "apikey: $ANON" -H "Content-Type: application/json" \
+  -d "{\"email\":\"$TEST\",\"password\":\"TestPassword123!\"}"
+# 2. mark email_verified=true via direct SQL (bypasses email verification)
+psql "$INSFORGE_DB_URL" -c "UPDATE auth.users SET email_verified=true WHERE email='$TEST';"
+# 3. login → Set-Cookie header reveals the exact name
+curl -sD /dev/stderr -X POST "$API_URL/api/auth/sessions" \
+  -H "apikey: $ANON" -H "Content-Type: application/json" \
+  -d "{\"email\":\"$TEST\",\"password\":\"TestPassword123!\"}" 2>&1 \
+  | grep -i "^set-cookie:"
+# 4. cleanup
+psql "$INSFORGE_DB_URL" -c "DELETE FROM auth.users WHERE email='$TEST';"
+```
+
+Auth API endpoints mined from `node_modules/@insforge/sdk/dist/index.js`:
+
+```
+POST /api/auth/users                          signup
+POST /api/auth/sessions                       login  (sets insforge_refresh_token cookie)
+POST /api/auth/refresh                        refresh
+POST /api/auth/logout                         signout
+GET  /api/auth/sessions/current               current session
+GET  /api/auth/profiles/current               current profile
+POST /api/auth/email/send-verification        resend verify email
+POST /api/auth/email/verify                   confirm verify code
+POST /api/auth/email/send-reset-password      send reset email
+POST /api/auth/email/exchange-reset-password-token  exchange code
+POST /api/auth/email/reset-password           apply new password with otp
+POST /api/auth/oauth/...                      OAuth
+POST /api/auth/id-token                       Google id_token flow
+```
+
+### 5b. Legacy notes on cookie-guessing (now solved)
 
 The InsForge SDK writes httpOnly refresh cookies, but the exact cookie name (`insforge-refresh-token`? `sb-auth-token`-style? something project-scoped?) must be verified by actually signing in once and watching `Set-Cookie` headers:
 
