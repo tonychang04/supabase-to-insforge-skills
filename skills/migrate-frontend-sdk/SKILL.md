@@ -409,6 +409,30 @@ console.log(`Rewrote ${fromRewrites} .from() + ${insertRewrites} .insert() calls
 
 Run: `npm i -D ts-morph && npx tsx scripts/migrate-ast.ts`.
 
+### 8. Env var names — beyond the provider wrapper
+
+`process.env.NEXT_PUBLIC_SUPABASE_*` references are often **outside** the `lib/supabase/client.ts` file that you rewrote. Grep broadly before declaring the migration done:
+
+```bash
+grep -rnE "NEXT_PUBLIC_SUPABASE_|SUPABASE_SERVICE_ROLE_KEY|SUPABASE_JWT_SECRET|SUPABASE_URL(?!.*pooler)" \
+  --include='*.ts' --include='*.tsx' . | grep -v node_modules | grep -v __tests__
+```
+
+Common hits not caught by method-call sed:
+- **Auth provider "is configured?" guards** — code reads env vars directly to decide whether to enable auth features (stet: `lib/auth.tsx:46-47`). If you miss these, runtime error is `"Authentication not configured"` even though the build compiles clean.
+- **Zod-validated env loaders** — a `lib/config/env.ts` or similar that types and validates the env, often with the old names as keys. Rename both the interface fields AND the getter fallbacks.
+- **`.env.example`, `.env.local`** — rename values you seed users with.
+- **CI/CD pipeline env** — dashboards, deployment configs often still have `NEXT_PUBLIC_SUPABASE_*` keys. Update them too; missed ones will manifest as runtime "Authentication not configured" in prod.
+
+Rename map (stet trial, verified):
+
+| Old | New |
+|---|---|
+| `NEXT_PUBLIC_SUPABASE_URL` | `NEXT_PUBLIC_INSFORGE_BASE_URL` |
+| `NEXT_PUBLIC_SUPABASE_ANON_KEY` | `NEXT_PUBLIC_INSFORGE_ANON_KEY` |
+| `SUPABASE_SERVICE_ROLE_KEY` | `INSFORGE_API_KEY` |
+| `SUPABASE_JWT_SECRET` | `INSFORGE_JWT_SECRET` (if still needed — InsForge sessions are JWT, secret usage differs) |
+
 ## Hard lessons from a real trial (stet repo, 2026-04-13)
 
 These are **failures** encountered when attempting a mechanical sed-based migration. Encode them as non-negotiable rules.
