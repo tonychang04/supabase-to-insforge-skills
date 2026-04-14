@@ -288,6 +288,92 @@ grep -rnE "from '@insforge/sdk'" --include='*.ts' --include='*.tsx' --include='*
 grep -rnE "client\.(auth|database|storage|functions)" --include='*.ts' --include='*.tsx' --include='*.js' --include='*.jsx' . | wc -l  # non-zero
 ```
 
+## Hard lessons from a real trial (stet repo, 2026-04-13)
+
+These are **failures** encountered when attempting a mechanical sed-based migration. Encode them as non-negotiable rules.
+
+### 1. sed cannot rewrite multi-line call chains
+
+Common Next.js pattern splits receiver and method across lines:
+
+```typescript
+const { data, error } = await supabase
+    .from("vdr_snapshots")           // ← .from on a different line from supabase
+    .select("id, label");
+```
+
+`sed -E 's/\bsupabase\.from\(/supabase.database.from(/g'` does NOT match this — the newline between `supabase` and `.from` is on the literal input, not the regex. Result: you think you've rewritten the codebase, `npm run build` fails on dozens of these.
+
+**Rule:** for rewrites more ambitious than a single token, use an AST transformer — `ts-morph`, `jscodeshift`, or `@ast-grep/cli`. Not sed, not perl, not find-replace in an IDE (which also struggles with method-receiver breaks across lines).
+
+```bash
+# Minimal ts-morph script sketch
+npx ts-node -e '
+  import { Project } from "ts-morph";
+  const p = new Project({ tsConfigFilePath: "tsconfig.json" });
+  p.getSourceFiles().forEach(sf => {
+    sf.getDescendantsOfKind(SyntaxKind.CallExpression).forEach(call => {
+      const expr = call.getExpression();
+      if (expr.getKind() === SyntaxKind.PropertyAccessExpression) {
+        const prop = expr as PropertyAccessExpression;
+        if (prop.getName() === "from" && isClientReceiver(prop.getExpression())) {
+          prop.replaceWithText(prop.getExpression().getText() + ".database.from");
+        }
+      }
+    });
+  });
+  p.save();
+'
+```
+
+### 2. `.insert({...})` → `.insert([{...}])` needs AST, not regex
+
+Regex can't reliably decide whether an `.insert(` argument is already an array, a spread, a variable, or an inline object. Don't try. Use an AST walk that checks the first argument's kind.
+
+### 3. The build IS the test
+
+Do NOT claim the migration is done until `npm run build` exits 0. Intermediate states ("imports swapped, call sites rewritten, compile fails") are migration-in-progress, not migration-done. The skill's verification step `npx tsc --noEmit && npm run build` must succeed; all other signals are secondary.
+
+### 4. Inspect the actual SDK types before rewriting
+
+Published docs, CLI `docs` command, and community examples can lag the installed SDK version. Before bulk rewrites:
+
+```bash
+# Find the source of truth for method names + signatures
+find node_modules/@insforge/sdk -name "*.d.ts" | head -5
+grep -rE "auth\.(getCurrentUser|getUser|onAuthStateChange|onSessionChange)" node_modules/@insforge/sdk/dist/ | head
+grep -rE "^export.*createClient|^declare.*createClient" node_modules/@insforge/sdk/dist/ | head
+```
+
+Especially check: exact `createClient` return type, namespacing (`.database.from` vs `.from`), method renames (`getUser` vs `getCurrentUser`), array-wrap requirements on `insert`.
+
+### 5. SSR cookie names are not documented; inspect runtime
+
+The InsForge SDK writes httpOnly refresh cookies, but the exact cookie name (`insforge-refresh-token`? `sb-auth-token`-style? something project-scoped?) must be verified by actually signing in once and watching `Set-Cookie` headers:
+
+```bash
+# During the migration, log in manually via the migrated frontend, then:
+curl -sI -X POST "$INSFORGE_BASE_URL/api/auth/sessions" \
+  -H "Content-Type: application/json" \
+  -d '{"email":"<test>","password":"<test>"}' 2>&1 | grep -i "set-cookie"
+```
+
+Do NOT guess at the cookie name prefix; hardcoding `insforge-*refresh*` in middleware will silently kick every logged-in user out if the real name is different.
+
+### 6. Admin API methods are NOT 1:1 with Supabase
+
+`supabase.auth.admin.createUser`, `generateLink`, `getUserByEmail`, `deleteUser` — these map to different InsForge shapes (if at all). Grep every `auth.admin.` call, verify each against the SDK types, and surface any without direct equivalents for manual redesign.
+
+### 7. SSR via `@supabase/ssr` has no direct replacement
+
+`@supabase/ssr` provided `createBrowserClient` / `createServerClient` with explicit cookie getAll/setAll hooks for Next.js App Router. InsForge SDK does not ship an equivalent. Options:
+
+- **Option A (simplest):** drop SSR auth entirely. All auth reads happen client-side via `createClient().auth.getCurrentUser()`. Server components that need the user fall back to a client component shell. Removes a lot of complexity at the cost of a render-flicker on auth pages.
+- **Option B:** write a thin SSR wrapper (~30 LOC): parse the refresh cookie out of the request, call `client.auth.refreshSession({ refreshToken })` server-side, return the client for downstream queries. Fragile — depends on cookie-name stability.
+- **Option C:** move server-side DB access to the admin client (`INSFORGE_API_KEY`) and do auth checks via your own session table. Most invasive but most portable.
+
+Don't attempt Option B as a first pass unless you've verified the cookie name (see #5).
+
 ## Common pitfalls
 
 - **`.insert({...})` without array wrap**: compiles, calls out, 400 at runtime. Review every `.insert(` hit manually — sed can't decide array-wrap on multi-line payloads.
