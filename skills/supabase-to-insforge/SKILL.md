@@ -209,3 +209,29 @@ Orchestration only — never modifies data, only dispatches. The orchestrator is
 - **Treating reference repo as current**: The github.com/InsForge/supabase-to-insforge repo assumes legacy schema (`_accounts`, `_storage`). Against modern InsForge (which your probe detects), its auth.users→_accounts and auth.uid()→uid() transforms are **wrong**. Use child skills instead.
 - **Forgetting to capture source state first**: Don't start the trial before the source probe completes — you lose the comparison baseline.
 - **Not asking about service role key early**: private buckets (most real apps have them) can't be exported without `SUPABASE_SERVICE_ROLE_KEY`. Ask up front.
+
+---
+
+## Verified migration archetype #2 — Drizzle-ORM app (opendata, 2026-04-15)
+
+Second migration trial: https://github.com/JaehoonSon/opendata (Jaehoon's Agentic Hyperpersonalization Platform → InsForge `hb42d4y3`). Profile:
+
+- **Data access** through Drizzle ORM (not Supabase REST)
+- **Source DB** 12 tables, 0 rows (greenfield), 13 RLS policies, `handle_new_user` trigger on `auth.users`
+- **Source storage** 0 buckets — migrate-storage not invoked
+- **Source edge functions** 0 deployed, no `supabase/functions/` dir — migrate-edge-functions not invoked
+- **Call sites** 7 total, all `supabase.auth.*` (no `.from()`, `.storage.`, `.functions.`, `.channel()`)
+- **Build result** `pnpm --filter web build` passes; `curl /onboard` with access cookie renders the authed page with the user's org slug
+
+**Key finding that separates this archetype from the stet archetype:**
+
+> When the app uses an ORM (Drizzle, Prisma, Kysely) that connects directly to Postgres, the `migrate-frontend-sdk` skill only touches the **auth** surface. `.database.from(...)` rewrites (the 92-site AST work on stet) are unnecessary — ORM queries stay unchanged. This is qualitatively 5–10× less work.
+
+**Trigger to recognize this archetype during Step 0 probing:** if `grep -rlE "from ['\"]@supabase/supabase-js" | grep -v lib/supabase/` returns 0 files OR all hits are in the client setup modules only, and `package.json` includes a Postgres ORM (`drizzle-orm`, `prisma`, `kysely`, `@prisma/client`), inform the user this will be a much smaller migration than a typical `supabase-js`-everywhere app.
+
+Two new pitfalls captured from opendata (both added to migrate-frontend-sdk/SKILL.md):
+
+1. **Canonical InsForge SSR pattern** uses `isServerMode: true` + `edgeFunctionToken: accessToken` and **TWO app-managed cookies** (`insforge_access_token` 15m + `insforge_refresh_token` 7d). Earlier stet-era assumptions about a single SDK-managed cookie were superseded.
+2. **OAuth callback param is `insforge_code`** (not `code`). Old Supabase-style `?code=xxx` parsing silently fails.
+
+Also: **modern InsForge auto-attaches `project_admin_policy TO project_admin USING (true) WITH CHECK (true)` on every RLS-enabled table.** The reference repo's admin-policy-injection logic is redundant on modern targets (still correct on legacy).
