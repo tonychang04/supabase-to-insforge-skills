@@ -543,7 +543,117 @@ grep -rE "^export.*createClient|^declare.*createClient" node_modules/@insforge/s
 
 Especially check: exact `createClient` return type, namespacing (`.database.from` vs `.from`), method renames (`getUser` vs `getCurrentUser`), array-wrap requirements on `insert`.
 
-### 5. SSR cookie name — verified 2026-04-13
+### 5. SSR cookie pattern — canonical, from official `insforge-skills`
+
+**CRITICAL CORRECTION (2026-04-15).** Earlier versions of this skill described SSR as reading a single SDK-set cookie `insforge_refresh_token` and calling `refreshSession`. That works but misses the official pattern, which is materially different and required for `client.database.*` / `client.storage.*` calls to execute **with the signed-in user's identity** (so RLS applies correctly).
+
+**Canonical pattern (from https://github.com/InsForge/insforge-skills — `skills/insforge/auth/ssr-integration.md`):**
+
+1. **Server client must opt into server mode:**
+   ```typescript
+   createClient({
+     baseUrl,
+     anonKey,
+     isServerMode: true,              // disables browser auto-detect, cookies, etc.
+     edgeFunctionToken: accessToken,  // authenticates outgoing requests as this user
+   })
+   ```
+   Missing `edgeFunctionToken` → every `.database.from(...)` call hits RLS as anon even when a valid access token exists in a cookie.
+
+2. **Two cookies, APP-managed (not SDK-managed):**
+
+   | Cookie | TTL | What for |
+   |---|---|---|
+   | `insforge_access_token` | 15 min | sent as bearer on every authenticated DB/storage/function call |
+   | `insforge_refresh_token` | 7 days | used by middleware to mint new access tokens |
+   | `insforge_code_verifier` | 10 min | PKCE verifier, written before OAuth redirect, read+deleted on callback |
+
+   **All three are httpOnly, Secure, SameSite=lax, Path=/.** The app's server actions and callback route explicitly `cookieStore.set(...)` them — the SDK in `isServerMode: true` does NOT touch browser cookies.
+
+3. **Sign-in server action must call `setAuthCookies(data.accessToken, data.refreshToken)` AFTER `signInWithPassword`.** Omit this and the user signs in but every subsequent server render thinks they're anonymous.
+
+4. **OAuth flow requires `skipBrowserRedirect: true` + manual code exchange.** The browser SDK auto-detects `insforge_code` in the URL; `isServerMode: true` disables this. Flow:
+   - Server action: `signInWithOAuth({ provider, redirectTo, skipBrowserRedirect: true })` → returns `{ url, codeVerifier }`
+   - Write `codeVerifier` to httpOnly cookie
+   - Redirect browser to `url`
+   - Provider redirects back to your `redirectTo` with `?insforge_code=<code>`
+   - Callback route reads cookie, calls `exchangeOAuthCode(code, codeVerifier)`, sets auth cookies, deletes verifier cookie
+   - **`redirectTo` must be your app URL** (`NEXT_PUBLIC_SITE_URL`), NOT your InsForge URL. The backend appends `?insforge_code=...` and redirects there; if it points at InsForge you get `Cannot GET /auth/callback`.
+
+5. **Middleware pattern — refresh proactively:**
+   - Read both cookies from the request
+   - If access token missing but refresh present → call `refreshSession({refreshToken})`, write both cookies on the response
+   - Use access-token presence as the "authenticated" signal for route guards
+   - Don't call `.getCurrentUser()` in middleware on every request (unnecessary round-trip)
+
+6. **The OAuth query param name is `insforge_code`**, not `code`. Supabase used `?code=`. Callback handlers need to read either:
+   ```typescript
+   const code = searchParams.get("insforge_code") ?? searchParams.get("code");
+   ```
+
+7. **`signUp` return value:** if email verification is disabled, `data.accessToken` is populated — treat it exactly like sign-in and set cookies. If verification is required, `accessToken: null` and you get `requireEmailVerification: true` — show "check your email" and don't set cookies yet.
+
+8. **`exchangeCodeForSession` is renamed** to `exchangeOAuthCode(code, codeVerifier?)`. Always pass the codeVerifier from your stored cookie.
+
+**Minimal cookie-helper module (drop-in):**
+
+```typescript
+// lib/insforge/cookies.ts
+import { cookies } from "next/headers"
+
+export const ACCESS_COOKIE = "insforge_access_token"
+export const REFRESH_COOKIE = "insforge_refresh_token"
+export const CODE_VERIFIER_COOKIE = "insforge_code_verifier"
+
+const BASE = {
+  httpOnly: true,
+  secure: process.env.NODE_ENV === "production",
+  sameSite: "lax" as const,
+  path: "/",
+}
+
+export async function setAuthCookies(accessToken: string, refreshToken: string) {
+  const s = await cookies()
+  s.set(ACCESS_COOKIE, accessToken, { ...BASE, maxAge: 60 * 15 })
+  s.set(REFRESH_COOKIE, refreshToken, { ...BASE, maxAge: 60 * 60 * 24 * 7 })
+}
+export async function clearAuthCookies() {
+  const s = await cookies()
+  s.delete(ACCESS_COOKIE); s.delete(REFRESH_COOKIE); s.delete(CODE_VERIFIER_COOKIE)
+}
+export async function setCodeVerifierCookie(v: string) {
+  (await cookies()).set(CODE_VERIFIER_COOKIE, v, { ...BASE, maxAge: 60 * 10 })
+}
+export async function readAccessToken() {
+  return (await cookies()).get(ACCESS_COOKIE)?.value
+}
+export async function readRefreshToken() {
+  return (await cookies()).get(REFRESH_COOKIE)?.value
+}
+export async function readCodeVerifier() {
+  return (await cookies()).get(CODE_VERIFIER_COOKIE)?.value
+}
+```
+
+**Server client using it:**
+
+```typescript
+// lib/insforge/server.ts
+import { createClient as createInsforgeClient } from "@insforge/sdk"
+import { readAccessToken } from "./cookies"
+
+export async function createClient() {
+  const accessToken = await readAccessToken()
+  return createInsforgeClient({
+    baseUrl: process.env.NEXT_PUBLIC_INSFORGE_BASE_URL!,
+    anonKey: process.env.NEXT_PUBLIC_INSFORGE_ANON_KEY!,
+    isServerMode: true,
+    edgeFunctionToken: accessToken,
+  } as Parameters<typeof createInsforgeClient>[0])
+}
+```
+
+### 5b. Legacy guess about cookie name (superseded — kept for history)
 
 Actual observed cookie after live signup + email_verified=true flag + login:
 
