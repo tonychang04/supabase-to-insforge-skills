@@ -170,6 +170,30 @@ Compare each count to your source probe. Admin bypass policy count should equal 
 
 ## Common pitfalls (from trial 2026-04-13 against real source)
 
+### CRITICAL: reload PostgREST schema cache after schema changes (opendata 2026-04-15)
+
+After running `CREATE TABLE` / `ALTER TABLE ADD FOREIGN KEY` etc., PostgREST's in-memory schema cache is **stale**. SDK calls like:
+
+```typescript
+insforge.database.from('org_members').select('*, organizations(id, name, slug)')
+```
+
+will fail with:
+
+```
+{"code":"PGRST200","message":"Could not find a relationship between 'org_members' and 'organizations' in the schema cache"}
+```
+
+even though the FK constraint exists in Postgres. **Mandatory fix** — run this immediately after every schema migration:
+
+```bash
+psql "$INSFORGE_DB_URL" -c "NOTIFY pgrst, 'reload schema';"
+```
+
+This notifies PostgREST (listening via LISTEN pgrst) to rebuild its cache. Wait ~2 seconds after before hitting the REST API. Add this to the end of your migration runner; missing it makes `.select('*, relation(...)')` silently fail on freshly-migrated tables.
+
+### Other pitfalls
+
 - **`transaction_timeout` config unknown** — benign, pg_dump emits `SET transaction_timeout=0` which InsForge's Postgres version doesn't recognize. Transform strips `^SET `.
 - **`schema public already exists`** — pg_dump emits `CREATE SCHEMA public`. Transform strips it.
 - **`function gen_random_bytes(integer) does not exist`** during `CREATE TABLE` with `DEFAULT encode(gen_random_bytes(32), 'hex')`** — source qualified as `extensions.gen_random_bytes`. InsForge has pgcrypto in `public`, not `extensions`. Transform rewrites to `public.gen_random_bytes`. Without explicit schema qualifier, search_path resolution during DDL context fails even though `pgcrypto` is installed.
