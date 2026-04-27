@@ -41,6 +41,29 @@ SELECT
 
 If `existing_public_tables > 0`: stop, ask the user if this target should be wiped or if tables should be merged. Running this skill against a non-empty target will fail.
 
+## Migration delivery: `db migrations` register, don't direct-psql
+
+Earlier guidance in this skill shows applying the transformed SQL via `psql -f insforge-ready.sql`. That works, but **the preferred path is `npx @insforge/cli db migrations`** so the schema is registered as a tracked baseline and future schema changes chain from a known state. Confirmed against modern InsForge on the wdabt trial (2026-04-26):
+
+```bash
+mkdir -p migrations
+TS=$(date -u +%Y%m%d%H%M%S)
+cp insforge-ready.sql "migrations/${TS}_baseline-from-supabase.sql"
+# ensure .insforge/project.json points at the right project, then:
+npx @insforge/cli db migrations up --all
+```
+
+InsForge's migration runner wraps each file in a backend-managed transaction — do not put `BEGIN`/`COMMIT`/`ROLLBACK` in the SQL. The transform script already complies.
+
+If you must direct-psql (e.g., to bootstrap before the project is linked), the dry-run check is:
+
+```bash
+psql "$INSFORGE_DB_URL" -v ON_ERROR_STOP=1 --single-transaction \
+  -c "BEGIN;" -f insforge-ready.sql -c "ROLLBACK;"
+```
+
+A clean dry-run prints `ROLLBACK` at the end with `WARNING:  there is no transaction in progress` — the transaction was rolled back successfully.
+
 ## Procedure
 
 ### 1. Dump source schema
@@ -194,6 +217,7 @@ This notifies PostgREST (listening via LISTEN pgrst) to rebuild its cache. Wait 
 
 ### Other pitfalls
 
+- **pg_dump v17 emits `\restrict` / `\unrestrict` psql meta-commands and `SELECT pg_catalog.set_config('search_path', '', false);`** (wdabt trial, 2026-04-26). These are valid when applied via `psql` but the InsForge `db migrations` runner is the backend, not psql — `\restrict` is unrecognized, and `set_config(...,'',false)` clears the explicit `SET search_path = public, pg_catalog` that the transform prepends, breaking unqualified function references inside policies and triggers. Transform strips all three.
 - **`transaction_timeout` config unknown** — benign, pg_dump emits `SET transaction_timeout=0` which InsForge's Postgres version doesn't recognize. Transform strips `^SET `.
 - **`schema public already exists`** — pg_dump emits `CREATE SCHEMA public`. Transform strips it.
 - **`function gen_random_bytes(integer) does not exist`** during `CREATE TABLE` with `DEFAULT encode(gen_random_bytes(32), 'hex')`** — source qualified as `extensions.gen_random_bytes`. InsForge has pgcrypto in `public`, not `extensions`. Transform rewrites to `public.gen_random_bytes`. Without explicit schema qualifier, search_path resolution during DDL context fails even though `pgcrypto` is installed.

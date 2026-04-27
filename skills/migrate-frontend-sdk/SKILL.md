@@ -205,6 +205,8 @@ npm install @insforge/sdk@latest
 
 Replace `NEXT_PUBLIC_SUPABASE_*` → `NEXT_PUBLIC_INSFORGE_*` (see cheat sheet above). Keep a `.env.backup` of the old values during cutover.
 
+Framework-specific env prefixes (see also the framework-detection table at the bottom): Next.js uses `NEXT_PUBLIC_*`/`process.env.*`; Vite uses `VITE_*`/`import.meta.env.*`; Nuxt uses `NUXT_PUBLIC_*` (public) / `NUXT_*` (private) accessed via `useRuntimeConfig().public.*` / `useRuntimeConfig().*`.
+
 ### 3. Replace SDK initialization file
 
 Typically `lib/supabase.ts` / `lib/supabase/client.ts`:
@@ -758,3 +760,462 @@ Don't attempt Option B as a first pass unless you've verified the cookie name (s
 ## Scope boundary
 
 Covers: SDK swap across imports, client init, auth/database/storage/functions call-site rewrites, env variable rename, dependency swap in package.json. Does NOT cover: rebuilding SSR/cookie session infrastructure (requires per-app design), migrating auth UI components, realtime channel rearchitecture, custom RPC shape verification (user must test each).
+
+## Hard lessons from the rayaboy-apply-hub trial (Vite SPA, 2026-04-23)
+
+Full migration of a Vite + React 18 SPA (40 `.from()`, 3 storage, 3 functions.invoke, 11 auth sites, 2 `supabase.channel()` — which the first grep missed). Build green + 5/5 Playwright smokes passed. These are the *new* learnings beyond the stet (Next.js) trial.
+
+### A. Inventory grep must include multi-line method chains
+
+`grep -E "supabase\.(auth|from|storage|functions|channel|rpc)"` **misses** chained calls split across lines:
+
+```tsx
+const channel = supabase
+  .channel("dashboard-jobs")
+```
+
+The single-line grep found 0 `channel` hits → they blew up at typecheck time much later. Fix: also grep chain continuations.
+
+```bash
+# Multi-line chain catcher (run AFTER the single-line inventory):
+grep -rnE "^\s*\.(channel|from|rpc|storage|functions|auth)\(" --include='*.ts' --include='*.tsx' src | head -30
+```
+
+Add this to the skill's diagnostic probe unconditionally — realtime especially loves to hide here, and the default Supabase codegen pattern splits receiver and method on its own line.
+
+### B. SDK surface (verified from installed `@insforge/sdk@latest` 2026-04-23)
+
+Re-verify on upgrade — the schema can and does evolve.
+
+**`createClient` config** (browser):
+```ts
+createClient({ baseUrl: string; anonKey: string; isServerMode?: boolean; edgeFunctionToken?: string })
+```
+
+**Auth methods present** (+ their installed shapes):
+- `signUp(CreateUserRequest)` — **`CreateUserRequest = { email, password, name?, redirectTo?, autoConfirm? }`** (the Zod schema does include `name` and `redirectTo` as optional — last skill revision incorrectly said signup was email+password only and required a separate `setProfile()` call. You can pass `name` directly.)
+- `signInWithPassword({ email, password })` — returns `{data: {user, accessToken, refreshToken?, csrfToken?}, error}`
+- `signOut()` — returns `{error}`
+- `getCurrentUser()` — returns `{data: {user: UserSchema | null}, error}` where `UserSchema = {id, email, emailVerified, providers?, createdAt, updatedAt, profile, metadata}` (all camelCase)
+- `sendResetPasswordEmail({ email, redirectTo? })`
+- `exchangeResetPasswordToken({ email, code })` → `{data: {token, ...}, error}` — the returned **token** is what you pass as `otp` to `resetPassword()`, NOT the raw 6-digit code
+- `resetPassword({ newPassword, otp })` — `otp` = token from exchange step OR token from magic-link `?token=` query param
+- `setProfile(Record<string, unknown>)` — jsonb passthrough — extra fields (e.g. `first_name`, `last_name`) are preserved alongside canonical `name`/`avatar_url`
+- `resendVerificationEmail`, `verifyEmail`, `refreshSession`, `signInWithOAuth`, `exchangeOAuthCode`, `signInWithIdToken`, `getProfile`
+
+**Auth methods absent** — the call site must be *rebuilt*, not renamed:
+- `onAuthStateChange` — poll `getCurrentUser()` on mount + `visibilitychange`; expose a `refreshUser()` in context so sign-in/out handlers can force-sync.
+- `getSession()` — there is no session object. Use `getCurrentUser()` for user identity; access tokens live in httpOnly cookies in browser mode.
+- `updateUser({password})` — password changes go through the reset-password flow.
+- `auth.admin.*` — no admin namespace on the client.
+
+### C. Reset-password flow — two shapes, one page
+
+InsForge emails can deliver either a 6-digit code *or* a magic link. When the link is clicked, the backend pre-exchanges it and sends the user to `redirectTo?token=<server-minted-token>&insforge_status=ready&insforge_type=reset_password`.
+
+Your reset page should handle both:
+```tsx
+const urlToken = params.get("token");
+const linkFlow = Boolean(urlToken && params.get("insforge_status") === "ready");
+// ...
+let token = urlToken;
+if (!token) {
+  const { data, error } = await insforge.auth.exchangeResetPasswordToken({ email, code });
+  if (error) return setError(error.message);
+  token = data.token;
+}
+await insforge.auth.resetPassword({ newPassword, otp: token });
+```
+
+Common mistake: calling `resetPassword({otp: code})` with the raw 6-digit code works for some backends but fails on modern InsForge — the exchange step is mandatory.
+
+### D. Storage — two subtle API shape changes from Supabase AND from older skill revisions
+
+| Op | Supabase | InsForge SDK (installed) |
+|---|---|---|
+| `remove` | `remove([path])` — **array** | `remove(path)` — **string** (earlier skill table wrongly showed array) |
+| `getPublicUrl` | `{data: {publicUrl}}` | returns the **string directly**: `const url = bucket.getPublicUrl(key)` |
+| `createSignedUrl(path, expires)` | present | **absent**. Two workable substitutes below. |
+
+**Private-bucket preview without `createSignedUrl`:**
+
+The SDK's `download(key)` returns a Blob over an authenticated request. Wrap it for caller compatibility:
+
+```ts
+const getSignedUrl = async (filePath: string) => {
+  const { data: blob, error } = await insforge.storage.from("documents").download(filePath);
+  if (error || !blob) return null;
+  return URL.createObjectURL(blob);   // caller MUST revokeObjectURL on unmount
+};
+```
+
+At the HTTP layer, `GET /api/storage/buckets/<bucket>/objects/<urlEncodedKey>` with a valid bearer returns **`302` to a CloudFront pre-signed URL** (`cdn.insforge.dev/...?Expires=...&Signature=...`). Browser `fetch()` follows the redirect and you get the blob; you cannot read the `Location` header from the browser due to Fetch-spec opaque-redirect rules, so the HTTP trick is server-side only. Stick with the SDK `download()` path for client code.
+
+### E. Realtime — architectural shift, not a method rename
+
+This is the most common source of "it compiles, it silently doesn't work." Supabase and InsForge ship realtime but implement it in opposite ways:
+
+| | Supabase | InsForge |
+|---|---|---|
+| Event source | WAL tail (logical replication) — zero per-table setup | Explicit `realtime.publish(channel, event, payload)` calls — one trigger per table |
+| Default for a new table | `postgres_changes` events flow immediately | Nothing flows until you register a channel pattern + attach a trigger |
+| Filter mechanism | RLS on the source table, evaluated per subscriber on every change | RLS on `realtime.channels` (what a subscriber is allowed to *receive*), evaluated once on subscribe |
+
+A pure-frontend swap from `supabase.channel("x").on("postgres_changes", ...)` to `insforge.realtime.subscribe("x").on("UPDATE", ...)` compiles fine but sits dark — the WS connects, `subscribe()` returns `{ok: false, code: "UNAUTHORIZED", message: "Not authorized to subscribe to this channel"}` because no pattern matches "x" in `realtime.channels`. No events ever land.
+
+The full fix is frontend + backend. Use this template for each Supabase `postgres_changes` subscription in the app.
+
+#### Backend migration template (one per table that needs realtime)
+
+```sql
+-- 1. Register channel patterns subscribers can match.
+INSERT INTO realtime.channels (pattern, description, enabled) VALUES
+  ('row:<table>:%', 'Per-row <table> updates',        true),
+  ('list:<table>:%', 'Per-user <table> list updates', true)
+ON CONFLICT (pattern) DO UPDATE SET enabled = EXCLUDED.enabled;
+
+-- 2. RLS on realtime tables. Default is off (any authenticated user can
+--    subscribe to anything that matches a pattern). Always enable it for
+--    multi-user apps.
+ALTER TABLE realtime.channels ENABLE ROW LEVEL SECURITY;
+ALTER TABLE realtime.messages ENABLE ROW LEVEL SECURITY;
+
+-- 3. Subscribe policies using realtime.channel_name() — this function
+--    returns the SPECIFIC channel a subscriber is asking for (e.g.
+--    `row:orders:abc-123`), not the pattern.
+CREATE POLICY users_subscribe_own_rows ON realtime.channels FOR SELECT
+TO authenticated USING (
+  pattern = 'row:orders:%'
+  AND EXISTS (
+    SELECT 1 FROM public.orders o
+    WHERE o.id = NULLIF(split_part(realtime.channel_name(), ':', 3), '')::uuid
+      AND o.user_id = auth.uid()
+  )
+);
+CREATE POLICY users_subscribe_own_list ON realtime.channels FOR SELECT
+TO authenticated USING (
+  pattern = 'list:orders:%'
+  AND split_part(realtime.channel_name(), ':', 3) = auth.uid()::text
+);
+-- Messages need a SELECT policy for subscribers to read their stream:
+CREATE POLICY users_read_messages ON realtime.messages FOR SELECT
+TO authenticated USING (true);
+
+-- 4. Publish trigger. SECURITY DEFINER so the trigger can INSERT into
+--    realtime.messages even when the calling role cannot.
+CREATE OR REPLACE FUNCTION public.notify_<table>()
+RETURNS TRIGGER AS $$
+BEGIN
+  PERFORM realtime.publish(
+    'row:<table>:' || NEW.id::text,
+    TG_OP,
+    jsonb_build_object('new', to_jsonb(NEW),
+                       'old', CASE WHEN TG_OP='UPDATE' THEN to_jsonb(OLD) ELSE NULL END)
+  );
+  PERFORM realtime.publish(
+    'list:<table>:' || NEW.user_id::text,
+    TG_OP,
+    jsonb_build_object('id', NEW.id, 'status', NEW.status)
+  );
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, realtime;
+
+DROP TRIGGER IF EXISTS <table>_realtime ON public.<table>;
+CREATE TRIGGER <table>_realtime
+  AFTER INSERT OR UPDATE ON public.<table>
+  FOR EACH ROW EXECUTE FUNCTION public.notify_<table>();
+```
+
+Register the migration in `system.custom_migrations` (the `statements` column is `text[]` — pass `ARRAY[$sql$...$sql$]`, not a plain string).
+
+#### Frontend wiring template
+
+```tsx
+useEffect(() => {
+  if (!rowId) return;
+  const channel = `row:orders:${rowId}`;
+  let handler: ((p: { channel: string; event: string; payload: { new?: Row } }) => void) | null = null;
+  let cancelled = false;
+
+  (async () => {
+    await insforge.realtime.connect();
+    if (cancelled) return;
+    const sub = await insforge.realtime.subscribe(channel);
+    if (!sub.ok) {
+      // `sub.error` is only present when ok is false — TS won't narrow
+      // automatically from a simple truthy check on `sub.ok`.
+      console.warn("subscribe failed", "error" in sub ? sub.error : null);
+      return;
+    }
+    handler = (p) => {
+      if (p.channel !== channel) return;
+      if (p.payload?.new) setRow(p.payload.new);
+    };
+    insforge.realtime.on("UPDATE", handler);
+    insforge.realtime.on("INSERT", handler);
+  })();
+
+  return () => {
+    cancelled = true;
+    if (handler) {
+      insforge.realtime.off("UPDATE", handler);
+      insforge.realtime.off("INSERT", handler);
+    }
+    insforge.realtime.unsubscribe(channel);
+  };
+}, [rowId]);
+```
+
+#### Gotchas
+
+- **`on(event, cb)` is GLOBAL across subscribed channels.** If you subscribe to `order:A` and `order:B` on the same SDK instance and register one UPDATE handler, it fires for both. Always filter by `payload.channel` inside the handler.
+- **`SubscribeResponse` is a discriminated union** — `{ok: true, channel}` | `{ok: false, channel, error}`. Calling `sub.error` on a truthy-ok check fails TS narrowing; use `"error" in sub ? sub.error : null`.
+- **No `postgres_changes` event filter equivalent.** Supabase's `filter: "id=eq.X"` → InsForge equivalent is "put X in the channel name" (`row:orders:X`). You express the filter by naming, not by parameter.
+- **Anon users will always get UNAUTHORIZED** for policies scoped `TO authenticated`. Good default — if your app uses anonymous realtime, write a separate `TO anon` policy.
+- **`realtime.channel_name()` returns the concrete name being subscribed to**, not the pattern. Use it in the policy USING clause to extract the per-row / per-user id segment; use `split_part(channel_name(), ':', N)` to parse.
+- **Polling as a migration stopgap is fine** — pick 3-5s intervals scoped to the relevant useEffect lifecycle. But don't ship polling long-term without flagging the latency delta vs. the Supabase baseline.
+- **Register each migration in `system.custom_migrations`** after applying (the `statements` column is `text[]`, pass `ARRAY[<sql>::text]`). `pg_read_file` is superuser-only on managed InsForge — read the file into a local variable and embed as a dollar-quoted literal instead.
+
+#### Verification steps (copy-paste)
+
+```sql
+-- Channel registered + enabled:
+SELECT pattern, enabled FROM realtime.channels WHERE pattern LIKE '%<table>%';
+
+-- Policies in place:
+SELECT policyname FROM pg_policies WHERE schemaname='realtime';
+
+-- Trigger attached (not just the set_updated_at builtin):
+SELECT tgname FROM pg_trigger
+WHERE tgrelid = 'public.<table>'::regclass AND NOT tgisinternal;
+
+-- End-to-end: insert+update, inspect messages:
+INSERT INTO public.<table> (...) VALUES (...) RETURNING id \gset t_
+UPDATE public.<table> SET status='X' WHERE id = :'t_id';
+SELECT channel_name, event_name, payload FROM realtime.messages
+WHERE channel_name LIKE 'row:<table>:' || :'t_id' ORDER BY created_at;
+-- Cleanup so you don't pollute dev data:
+DELETE FROM public.<table> WHERE id = :'t_id';
+DELETE FROM realtime.messages WHERE channel_name LIKE '%' || :'t_id' || '%';
+```
+
+The final piece (authenticated subscribe + receive over WS) needs a real user session. Create a throwaway user via the admin API, flip `auth.users.email_verified=true` with psql (the only way to skip verification — `autoConfirm: true` in the signup request is silently ignored on modern InsForge), sign in, subscribe, trigger a DB change from the backend, assert the event lands. Cleanup with `DELETE FROM auth.users WHERE email = ...` at the end.
+
+### F. The AST rewriter needs to pick up project references
+
+Vite + React with a split `tsconfig.json` / `tsconfig.app.json` / `tsconfig.node.json` is the default Lovable/Vite setup. `new Project({tsConfigFilePath: "tsconfig.json"})` loads the ROOT config only — which has `"files": []` and project references. The script silently rewrites 0 files.
+
+Fix: point ts-morph at `tsconfig.app.json` (or whichever config actually lists source files):
+
+```ts
+const p = new Project({ tsConfigFilePath: "tsconfig.app.json" });
+```
+
+The skill's AST script snippet should call this out explicitly for Vite/Lovable apps. Previous (stet) trial used Next.js which has a single `tsconfig.json` with sources, so this didn't surface.
+
+### G. `Database<T>` generated types port cleanly when the schema is 1:1
+
+`src/integrations/supabase/types.ts` generated from `supabase gen types typescript` is usable as-is against InsForge *if* the migration preserved the schema exactly (same tables, same columns, same enums). Just move/copy the file to `src/integrations/insforge/types.ts` and update imports. Don't regenerate unless InsForge has a type-gen CLI and the schemas have diverged.
+
+### H. Vite env vars — framework-specific prefix and access
+
+Vite exposes env vars prefixed `VITE_` via `import.meta.env.VITE_*` (NOT `process.env.*`). Stet's Next.js migration notes about `NEXT_PUBLIC_*` do not carry over. Canonical env rewrite for Vite:
+
+| Supabase (Vite) | InsForge (Vite) |
+|---|---|
+| `VITE_SUPABASE_URL` | `VITE_INSFORGE_URL` |
+| `VITE_SUPABASE_PUBLISHABLE_KEY` / `VITE_SUPABASE_ANON_KEY` | `VITE_INSFORGE_ANON_KEY` |
+| `VITE_SUPABASE_PROJECT_ID` | (drop — not needed) |
+
+Framework detection → env prefix map (for the skill to use when bootstrapping the new `client.ts`):
+
+| Framework | prefix | access |
+|---|---|---|
+| Vite (React/Vue/Svelte) | `VITE_` | `import.meta.env.VITE_*` |
+| Next.js | `NEXT_PUBLIC_` | `process.env.NEXT_PUBLIC_*` |
+| Nuxt 3/4 | `NUXT_PUBLIC_` (public) / `NUXT_` (private) | `useRuntimeConfig().public.*` / `useRuntimeConfig().*` |
+| Astro | `PUBLIC_` | `import.meta.env.PUBLIC_*` |
+| Create React App | `REACT_APP_` | `process.env.REACT_APP_*` |
+
+### I. Getting the InsForge anon key (Vite / non-CLI path)
+
+If the project is already deployed and there's no `.insforge/project.json` locally, skip `npx @insforge/cli secrets get ANON_KEY` and use the admin HTTP API directly:
+
+```bash
+curl -sS "$INSFORGE_URL/api/secrets/ANON_KEY" -H "Authorization: Bearer $INSFORGE_ADMIN_KEY"
+# {"key":"ANON_KEY","value":"eyJhbGciOi..."}
+```
+
+This assumes you have the `ik_...` admin key from the migration. Document it in the orchestrator's credentials checklist.
+
+### J. Build is the typecheck
+
+Vite's `vite build` does NOT run `tsc`. Pre-existing type errors (undeclared columns, missing discriminator map cases) silently pass build. `tsc -p tsconfig.app.json --noEmit` is the real typecheck gate — run it, and if it finds errors, confirm they predate the migration (via `git stash` / branch check) before declaring migration-unrelated and moving on. Never edit unrelated pre-existing type errors as part of the migration commit.
+
+### K. Smoke test matrix worth running after every trial
+
+Minimum Playwright suite (see `tests/smoke.spec.ts` in the rayaboy trial):
+- Landing renders with zero `supabase` script src and zero console errors *other than* the expected `getCurrentUser()` 401 on anonymous load.
+- `/login`, `/signup`, `/reset-password` render their forms.
+- Signup form POSTs to `/api/auth/users` with the expected body shape.
+- Login with wrong creds produces a visible "Login failed" toast *and* the network request hits `/api/auth/sessions`.
+
+Filter expected noise: the browser will log `Failed to load resource: 401` from the SDK's initial `getCurrentUser()` call before a user is signed in. Match and exclude that specific error; don't gate on "zero console errors".
+
+## Hard lessons from a real Nuxt trial (wdabt, 2026-04-26)
+
+Full migration of `https://github.com/monid-ai/what-did-agents-buy-today` (Nuxt 4 + `@nuxtjs/supabase` + Vercel AI SDK + pg_cron worker app) to InsForge project `wtf-are-agents-buying`. New learnings beyond the stet (Next.js) and rayaboy (Vite) trials.
+
+### A. Minimal-touch rewrite trick: have `useSupabaseAdmin()` return `client.database` directly (wdabt trial, 2026-04-26)
+
+When the server-side helper exposes `client.database` (the InsForge SDK's database namespace), existing call sites using `.from(`, `.rpc(`, `.select`, `.insert`, `.update`, `.delete`, chained filters work unchanged. Single-file change to the helper avoids rewriting every server route.
+
+```typescript
+// app/server/utils/supabase.ts (the only file that needed editing)
+import { createClient } from '@insforge/sdk'
+type InsforgeClient = ReturnType<typeof createClient>
+type InsforgeDatabase = InsforgeClient['database']
+let _client: InsforgeClient | null = null
+export function useSupabaseAdmin(): InsforgeDatabase {
+  if (_client) return _client.database
+  const config = useRuntimeConfig()
+  _client = createClient({
+    baseUrl: config.public.insforgeBaseUrl,
+    anonKey: config.public.insforgeAnonKey || '',
+    isServerMode: true,
+    edgeFunctionToken: config.insforgeApiKey,
+  } as Parameters<typeof createClient>[0])
+  return _client.database
+}
+```
+
+Server-side admin auth uses `isServerMode: true` + `edgeFunctionToken: <ik_API_KEY>`. PostgREST honors the `ik_…` API key as `project_admin`.
+
+### B. Insert array-wrap is OPTIONAL on InsForge SDK 1.2.5+ — single object works (wdabt trial, 2026-04-26)
+
+Earlier skill text said "array wrap required". Verified against `npx @insforge/cli docs db typescript`: both `.insert({...})` and `.insert([{...}])` are documented and work on SDK ≥ 1.2.5. The AST script can skip the array-wrap pass for SDK ≥ 1.2.5 — saves work on legacy code.
+
+### C. `@nuxtjs/supabase` removal — Nuxt-specific call sites (wdabt trial, 2026-04-26)
+
+| Was | Replace with |
+|---|---|
+| `useSupabaseClient()` (auto-imported by module) | `useNuxtApp().$insforge` (provided by a `app/plugins/insforge.client.ts` plugin) |
+| `useSupabaseUser()` | `$insforge.auth.getCurrentUser()` (returns `{data:{user}, error}`) |
+| `supabase.channel(...).on('postgres_changes', ...)` | InsForge realtime — see realtime archetype below |
+| `supabase.channel(...).on('presence', ...)` / `.track(...)` | No direct equivalent. Rebuild via per-client `realtime.publish` heartbeat (or drop) |
+| `import type { RealtimeChannel } from '@supabase/supabase-js'` | drop — not needed, InsForge realtime uses string channel names |
+| nuxt.config `modules: ['@nuxtjs/supabase']` + `supabase: {...}` | drop both |
+| `runtimeConfig` keys `supabaseUrl/supabaseKey/supabaseServiceKey` | rename to `insforgeBaseUrl/insforgeAnonKey/insforgeApiKey` |
+| env `NUXT_PUBLIC_SUPABASE_URL` / `NUXT_PUBLIC_SUPABASE_KEY` / `SUPABASE_SERVICE_KEY` | `NUXT_PUBLIC_INSFORGE_BASE_URL` / `NUXT_PUBLIC_INSFORGE_ANON_KEY` / `NUXT_INSFORGE_API_KEY` |
+
+### D. Nuxt plugin pattern for client-side singleton (wdabt trial, 2026-04-26)
+
+```typescript
+// app/plugins/insforge.client.ts
+import { createClient } from '@insforge/sdk'
+export default defineNuxtPlugin(() => {
+  const config = useRuntimeConfig()
+  const client = createClient({
+    baseUrl: config.public.insforgeBaseUrl,
+    anonKey: config.public.insforgeAnonKey,
+  })
+  return { provide: { insforge: client } }
+})
+```
+
+Then components/composables use `const { $insforge } = useNuxtApp()`.
+
+### E. Global-feed realtime pattern — single channel, no per-user filter (wdabt trial, 2026-04-26)
+
+Much simpler than the per-row pattern in the rayaboy notes. Use this when a public feed broadcasts to all clients:
+
+```sql
+-- migrations/<ts>_realtime-feed-channel.sql
+INSERT INTO realtime.channels (pattern, description, enabled)
+VALUES ('feed:new', 'Public feed broadcast', true)
+ON CONFLICT (pattern) DO UPDATE SET enabled = EXCLUDED.enabled;
+
+CREATE OR REPLACE FUNCTION public.notify_feed_insert()
+RETURNS TRIGGER AS $$
+BEGIN
+  PERFORM realtime.publish('feed:new', 'INSERT_feed', to_jsonb(NEW));
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, realtime;
+
+DROP TRIGGER IF EXISTS feed_realtime_publish ON public.feed;
+CREATE TRIGGER feed_realtime_publish
+  AFTER INSERT ON public.feed
+  FOR EACH ROW EXECUTE FUNCTION public.notify_feed_insert();
+```
+
+Frontend:
+
+```typescript
+await $insforge.realtime.connect()
+const sub = await $insforge.realtime.subscribe('feed:new')
+if (!sub.ok) { console.warn('subscribe failed', 'error' in sub ? sub.error : null); return }
+$insforge.realtime.on('INSERT_feed', (payload) => prepend(payload as FeedItem))
+```
+
+No RLS needed if the feed is public — InsForge realtime is permissive by default. Add `ALTER TABLE realtime.channels ENABLE ROW LEVEL SECURITY` only if the channel must be access-restricted.
+
+### E1. Realtime WS auth: JWT (anon key or user JWT), NOT the admin `ik_…` API key (wdabt trial, 2026-04-26)
+
+The InsForge realtime WebSocket validates the bearer as a JWT. The admin API key (`ik_<hex>`) is a project-scoped opaque token, NOT a JWT — passing it as `edgeFunctionToken` for the realtime client fails the handshake with `Invalid token` even though the same client successfully calls `client.database.*` and `client.ai.*`.
+
+If the same code path needs both admin DB calls AND a realtime subscription, use **two clients**:
+
+```typescript
+// admin client — for .database, .ai, .storage, .functions with project_admin scope
+const admin = createClient({
+  baseUrl, anonKey,
+  isServerMode: true,
+  edgeFunctionToken: API_KEY,  // ik_…
+} as Parameters<typeof createClient>[0])
+
+// realtime client — anon-only; the WS upgrades using anonKey as a valid JWT
+const ws = createClient({ baseUrl, anonKey })
+await ws.realtime.connect()
+await ws.realtime.subscribe('feed:new')
+ws.realtime.on('INSERT_feed', handler)
+```
+
+Symptom when wrong: `subscribe` returns `{ok: false}` (or the connection drops) with `error: "Invalid token"`. The trigger still fires server-side and `realtime.messages` populates correctly — the failure is purely on the WS subscriber, not on the publish path. Verify by `SELECT count(*) FROM realtime.messages WHERE channel_name = '<channel>'` after a known INSERT before debugging the subscriber.
+
+### F. Vercel AI SDK (`ai` package) → InsForge AI is a clean swap (wdabt trial, 2026-04-26)
+
+The Vercel AI SDK Gateway pattern:
+
+```typescript
+import * as AISDK from 'ai'
+const { text } = await AISDK.generateText({
+  model: AISDK.gateway('xai/grok-4.1-fast-non-reasoning'),
+  system: SYSTEM_PROMPT,
+  prompt: userPrompt,
+  maxTokens: 120,
+})
+```
+
+becomes (OpenAI-compatible chat completions on the InsForge AI gateway):
+
+```typescript
+import { createClient } from '@insforge/sdk'
+const client = createClient({ baseUrl, anonKey, isServerMode: true, edgeFunctionToken: apiKey } as Parameters<typeof createClient>[0])
+const completion = await client.ai.chat.completions.create({
+  model: 'anthropic/claude-3.5-haiku',  // verify available models per project
+  messages: [
+    { role: 'system', content: SYSTEM_PROMPT },
+    { role: 'user', content: userPrompt },
+  ],
+  maxTokens: 120,
+})
+const text = completion.choices?.[0]?.message?.content ?? ''
+```
+
+Drop `@vercel/analytics` and `@vercel/speed-insights` separately if used — they are independent of the AI SDK swap. Keep `nitro: { preset: 'vercel' }` if deploying via `npx @insforge/cli deployments deploy` — that path still uses Vercel as the underlying runtime, just managed/billed through InsForge.
+
+### G. Pitfall: `pnpm remove @nuxtjs/supabase` fails postinstall (wdabt trial, 2026-04-26)
+
+`pnpm remove @nuxtjs/supabase` fails postinstall because `nuxt prepare` reads `nuxt.config.ts` which still references the dropped module. Edit `nuxt.config.ts` to drop `'@nuxtjs/supabase'` from `modules` BEFORE running `pnpm remove`, or expect a postinstall failure (the dependency is removed, but the lockfile/types step errors). Order matters: config edit → install.

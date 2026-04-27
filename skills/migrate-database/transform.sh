@@ -18,11 +18,20 @@ set -euo pipefail
 IN="${1:-supabase-schema.sql}"
 OUT="${2:-insforge-ready.sql}"
 
-# Strip SET + COMMENT, rewrite role, fix extensions schema refs
+# Strip SET + COMMENT + psql meta-commands, rewrite role, fix extensions schema refs
+#
+# pg_dump v17 emits \restrict / \unrestrict psql meta-commands and a
+# SELECT pg_catalog.set_config('search_path', '', false) line. None of these
+# are valid when the migration runs through InsForge's `db migrations` runner
+# (which is the backend, not psql), and the set_config call also wipes the
+# explicit `SET search_path = public, pg_catalog` we prepend below.
 sed -E \
   -e '/^SET /d' \
   -e '/^COMMENT ON /d' \
   -e '/^CREATE SCHEMA /d' \
+  -e '/^\\restrict /d' \
+  -e '/^\\unrestrict /d' \
+  -e "/^SELECT pg_catalog\.set_config\('search_path', '', false\);/d" \
   -e 's/service_role/project_admin/g' \
   -e 's/extensions\.gen_random_bytes/public.gen_random_bytes/g' \
   -e 's/extensions\.uuid_generate_v4/public.gen_random_uuid/g' \

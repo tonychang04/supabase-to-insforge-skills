@@ -235,3 +235,44 @@ Two new pitfalls captured from opendata (both added to migrate-frontend-sdk/SKIL
 2. **OAuth callback param is `insforge_code`** (not `code`). Old Supabase-style `?code=xxx` parsing silently fails.
 
 Also: **modern InsForge auto-attaches `project_admin_policy TO project_admin USING (true) WITH CHECK (true)` on every RLS-enabled table.** The reference repo's admin-policy-injection logic is redundant on modern targets (still correct on legacy).
+
+---
+
+## Verified migration archetype #3 — pg_cron + vault + realtime worker app (wdabt, 2026-04-26)
+
+Third migration trial: https://github.com/monid-ai/what-did-agents-buy-today (Nuxt 4 dashboard for x402 settlements → InsForge `jbv4sa6j`). Profile:
+
+- **Stack**: Nuxt 4 + `@nuxtjs/supabase` (client) + `@supabase/supabase-js` (server, service-role) + Vercel AI SDK + Vercel deployment
+- **Source DB**: 10 public tables (`feed` 138K rows, `x402_services` 1218 rows, `queue`, `ingest`, `analytics_kv`, `x402_sync_state` + 4 unused), 3 views, 3 user functions, 5 RLS policies, **0 auth users**, **0 storage buckets**, **0 enums**
+- **Heavy use of Supabase-only DB extensions**: `pg_cron` (5 active schedules calling worker endpoints), `pg_net` (HTTP from triggers/cron), `supabase_vault` (3 named secrets — `vercel_url`, `worker_secret`, `x402_webhook_url`), `supabase_realtime` publication on `feed` table
+- **No auth, no storage** — drops migrate-auth and migrate-storage entirely
+
+**Key finding that separates this archetype:**
+
+> When the source app's "business logic" lives in `pg_cron` jobs and `vault` secrets driving HTTP callbacks to worker endpoints, **`pg_dump --schema=public` captures none of it**. The cron schedules live in `cron.job`, secrets in `vault.secrets`, the publication in `pg_publication_rel` — none in `public`. These need parallel, non-SQL migration:
+>
+> | Source artifact | Target equivalent | Migration command |
+> |---|---|---|
+> | `cron.schedule(...)` | InsForge schedules | `npx @insforge/cli schedules create --name --cron --url --method` |
+> | `vault.create_secret(...)` | InsForge secrets | `npx @insforge/cli secrets add KEY VALUE` |
+> | `ALTER PUBLICATION supabase_realtime ADD TABLE feed` | InsForge built-in realtime | no DDL — handled by SDK channels |
+> | `current_setting('app.settings.X', true)` in a trigger | reference an InsForge secret in the function body, or move logic to an edge function | rewrite the trigger function |
+>
+> When the schedules' `url := (SELECT decrypted_secret FROM vault.decrypted_secrets WHERE name = 'vercel_url') || '/v1/api/...'` pattern, the InsForge schedules `--headers` field supports `${{secrets.KEY_NAME}}` interpolation but the URL field is a literal — the worker URL must be hardcoded at schedule creation (or recreated when the deploy URL changes).
+
+**Trigger to recognize this archetype during Step 0 probing:** if the source probe shows `pg_cron` and/or `supabase_vault` in the extensions list, ask the user: "Do you have any `cron.schedule()` jobs or `vault.secrets` entries you depend on?" If yes, plan separate per-job and per-secret migration steps in addition to the SQL schema baseline.
+
+**Pitfalls captured from wdabt (added to migrate-database):**
+
+1. **pg_dump v17 emits `\restrict` / `\unrestrict` psql meta-commands** and `SELECT pg_catalog.set_config('search_path', '', false);`. These break the InsForge migrations runner (which is the backend, not psql), and the `set_config` call also wipes the `SET search_path = public, pg_catalog` that the transform prepends. Transform now strips all three.
+2. **`db migrations` baseline > direct psql.** Earlier guidance applied the schema with `psql -f insforge-ready.sql`. Cleaner: timestamp-rename the transformed file under `migrations/`, link the project, and run `npx @insforge/cli db migrations up --all` — the schema is then registered as a tracked baseline and future migrations chain from it. If the project isn't linked yet, dry-run with `psql --single-transaction -c "BEGIN;" -f file.sql -c "ROLLBACK;"` to verify cleanly first.
+
+### Frontend completion (wdabt trial, 2026-04-26)
+
+The Nuxt-specific frontend rewrite for this archetype is captured in `migrate-frontend-sdk/SKILL.md` under "Hard lessons from a real Nuxt trial (wdabt, 2026-04-26)". Key archetype-level facts the orchestrator should know:
+
+- A Nuxt SSR app keeps `nitro: { preset: 'vercel' }` and deploys via `npx @insforge/cli deployments deploy app`. The frontend deployment path uses Vercel under the hood — operationally InsForge-managed, doesn't require switching to compute/Fly.io.
+- The minimal-touch pattern is to have `useSupabaseAdmin()` (or whatever the existing server helper is named) return `client.database` directly so all `.from(`/`.rpc(`/`.select`/`.insert`/etc. call sites work unchanged. Single-file edit instead of bulk AST rewrite.
+- `@vercel/analytics` and `@vercel/speed-insights` should be removed separately — independent of the Supabase→InsForge swap.
+- Insert array-wrap is OPTIONAL on InsForge SDK 1.2.5+ — both `.insert({...})` and `.insert([{...}])` work. Skip the array-wrap AST pass for SDK ≥ 1.2.5.
+- Order matters when removing `@nuxtjs/supabase`: edit `nuxt.config.ts` to drop the module from `modules` BEFORE `pnpm remove`, otherwise `nuxt prepare` postinstall fails.
